@@ -5,11 +5,7 @@ require 'vendor/autoload.php';
 
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\RequestException;
-use GuzzleHttp\HandlerStack;
-use GuzzleHttp\Middleware;
 use Dotenv\Dotenv;
-use Symfony\Component\RateLimiter\RateLimiterFactory;
-use Symfony\Component\RateLimiter\Storage\InMemoryStorage;
 
 // Load environment variables
 $dotenv = Dotenv::createImmutable(__DIR__);
@@ -23,56 +19,8 @@ $salesChannelName = $_ENV['SALES_CHANNEL_NAME'];
 $customFieldsPrefix = $_ENV['CUSTOM_FIELDS_PREFIX'];
 $openAiApiKey = $_ENV['OPENAI_API_KEY'];
 
-// Initialize rate limiters
-$storage = new InMemoryStorage();
-
-$rainforestRateLimiter = new RateLimiterFactory([
-    'id' => 'rainforest_api_limiter',
-    'policy' => 'token_bucket',
-    'limit' => 60,
-    'rate' => ['interval' => '1 minute'],
-], $storage);
-
-$openAiRateLimiter = new RateLimiterFactory([
-    'id' => 'openai_api_limiter',
-    'policy' => 'token_bucket',
-    'limit' => 60,
-    'rate' => ['interval' => '1 minute'],
-], $storage);
-
-$shopwareRateLimiter = new RateLimiterFactory([
-    'id' => 'shopware_api_limiter',
-    'policy' => 'token_bucket',
-    'limit' => 100,
-    'rate' => ['interval' => '1 minute'],
-], $storage);
-
-// Function to create a Guzzle client with rate limiting middleware
-function createRateLimitedClient($rateLimiterFactory)
-{
-    $handlerStack = HandlerStack::create();
-    $handlerStack->push(Middleware::mapRequest(function ($request) use ($rateLimiterFactory) {
-        $limiter = $rateLimiterFactory->create($request->getUri()->getHost());
-        $limit = $limiter->consume(1);
-
-        if (!$limit->isAccepted()) {
-            // Sleep until the next token is available
-            $retryAfter = $limit->getRetryAfter()->getTimestamp() - time();
-            if ($retryAfter > 0) {
-                sleep($retryAfter);
-            }
-        }
-
-        return $request;
-    }));
-
-    return new Client(['handler' => $handlerStack]);
-}
-
-// Initialize clients
-$client = createRateLimitedClient($shopwareRateLimiter);
-$rainforestClient = createRateLimitedClient($rainforestRateLimiter);
-$openAiClient = createRateLimitedClient($openAiRateLimiter);
+// Initialize HTTP client
+$client = new Client();
 
 // Initialize error log
 $errorLog = [];
@@ -84,8 +32,8 @@ function logError($message)
     $timestamp = date('Y-m-d H:i:s');
     $errorLog[] = "[$timestamp] $message";
 }
- 
-// Function to save error log to file .
+
+// Function to save error log to file
 function saveErrorLog()
 {
     global $errorLog;
@@ -116,9 +64,12 @@ try {
         throw new Exception('No download links found in webhook payload');
     }
 
+    // Set webhook data globally for access in other functions
+    $GLOBALS['webhookData'] = $webhookData;
+
     // Process each JSON page sequentially
     foreach ($downloadLinks as $pageUrl) {
-        processJsonPage($pageUrl, $webhookData);
+        processJsonPage($pageUrl);
     }
 
     // Save error log after processing
@@ -137,13 +88,13 @@ try {
 }
 
 // Function to process a single JSON page
-function processJsonPage($pageUrl, $webhookData)
+function processJsonPage($pageUrl)
 {
-    global $rainforestClient;
+    global $client, $shopwareApiUrl, $shopwareClientId, $shopwareClientSecret, $salesChannelName, $customFieldsPrefix, $openAiApiKey;
 
     try {
         // Download the JSON page
-        $response = $rainforestClient->get($pageUrl);
+        $response = $client->get($pageUrl);
         $jsonData = json_decode($response->getBody(), true);
 
         if (json_last_error() !== JSON_ERROR_NONE) {
@@ -162,7 +113,7 @@ function processJsonPage($pageUrl, $webhookData)
                 continue; // Skip if product data is missing
             }
 
-            processProduct($productResult, $webhookData);
+            processProduct($productResult);
         }
 
     } catch (RequestException $e) {
@@ -173,7 +124,7 @@ function processJsonPage($pageUrl, $webhookData)
 }
 
 // Function to process a single product
-function processProduct($product, $webhookData)
+function processProduct($product)
 {
     global $client, $shopwareApiUrl, $salesChannelName, $customFieldsPrefix;
 
@@ -190,7 +141,7 @@ function processProduct($product, $webhookData)
         }
 
         // Map JSON fields to Shopware fields
-        $shopwareProductData = mapProductData($product, $webhookData);
+        $shopwareProductData = mapProductData($product);
 
         // Create the product in Shopware
         createProductInShopware($shopwareProductData);
@@ -236,9 +187,9 @@ function productExistsInShopware($productNumber)
 }
 
 // Function to map product data from JSON to Shopware format
-function mapProductData($product, $webhookData)
+function mapProductData($product)
 {
-    global $customFieldsPrefix, $salesChannelName;
+    global $customFieldsPrefix;
 
     $mappedData = [];
 
@@ -247,11 +198,10 @@ function mapProductData($product, $webhookData)
     $mappedData['name'] = $product['title'] ?? 'Unnamed Product';
     $mappedData['description'] = $product['description'] ?? '';
     $mappedData['releaseDate'] = isset($product['first_available']['raw']) ? formatReleaseDate($product['first_available']['raw']) : null;
-    $mappedData['manufacturer'] = getManufacturerId($product['brand'] ?? 'Unknown');
+    $mappedData['manufacturer'] = $product['brand'] ?? 'Unknown';
     $mappedData['keywords'] = $product['keywords'] ?? '';
     $mappedData['ratingAverage'] = $product['rating'] ?? null;
     $mappedData['ean'] = $product['ean'] ?? null;
-    $mappedData['salesChannel'] = getSalesChannelId($salesChannelName);
 
     // Custom fields
     $customFields = [];
@@ -265,7 +215,7 @@ function mapProductData($product, $webhookData)
     $customFields[$customFieldsPrefix . 'isBundle'] = $product['is_bundle'] ?? null;
     // ... Add other custom fields as per mapping table
 
-    $mappedData['customFields'] = array_filter($customFields, function($value) {
+    $mappedData['customFields'] = array_filter($customFields, function ($value) {
         return $value !== null;
     });
 
@@ -280,7 +230,7 @@ function mapProductData($product, $webhookData)
     }
 
     // Categories
-    $mappedData['categories'] = getCategoryIds($webhookData);
+    $mappedData['categories'] = getCategoryIds();
 
     // Prices
     if (isset($product['buybox_winner']['price']['value'])) {
@@ -299,6 +249,14 @@ function mapProductData($product, $webhookData)
     $mappedData['stock'] = $availabilityType === 'in_stock' ? 100 : 0;
     $mappedData['active'] = $availabilityType === 'in_stock';
 
+    // Sales channel assignment
+    $mappedData['visibilities'] = [
+        [
+            'salesChannelId' => getSalesChannelId(),
+            'visibility' => 30, // Visibility all
+        ],
+    ];
+
     // Images
     $images = [];
     if (isset($product['main_image']['link'])) {
@@ -315,12 +273,12 @@ function mapProductData($product, $webhookData)
 
     // Variants
     if (isset($product['variants']) && is_array($product['variants'])) {
-        $mappedData['variants'] = mapVariants($product['variants'], $mappedData);
+        $mappedData['configuratorSettings'] = mapVariants($product['variants']);
     }
 
     // Reviews
     if (isset($product['top_reviews']) && is_array($product['top_reviews'])) {
-        $mappedData['reviews'] = mapReviews($product['top_reviews'], $mappedData['productNumber']);
+        $mappedData['productReviews'] = mapReviews($product['top_reviews'], $mappedData['productNumber']);
     }
 
     // Return the mapped data
@@ -330,20 +288,12 @@ function mapProductData($product, $webhookData)
 // Function to standardize units using OpenAI API
 function standardizeUnits($value, $type)
 {
-    global $openAiApiKey, $openAiClient;
+    global $openAiApiKey;
 
     // Prepare the prompt
-    $prompt = "Convert the following $type to units compatible with Shopware 6. Provide the result as JSON with keys ";
+    $prompt = "Convert the following $type to standard units compatible with Shopware 6, and provide the result as JSON only without explanation:\n\n$value";
 
-    if ($type === 'weight') {
-        $prompt .= "`weight` in kilograms.";
-    } elseif ($type === 'dimensions') {
-        $prompt .= "`length`, `width`, and `height` in meters.";
-    }
-
-    $prompt .= " Only provide the JSON output without any explanation or additional text.\n\n$value";
-
-    $response = callOpenAiApi($prompt, $openAiClient);
+    $response = callOpenAiApi($prompt);
 
     // Parse the JSON response
     $standardizedData = json_decode($response, true);
@@ -357,31 +307,26 @@ function standardizeUnits($value, $type)
 }
 
 // Function to call OpenAI API
-function callOpenAiApi($prompt, $client)
+function callOpenAiApi($prompt)
 {
-    global $openAiApiKey;
+    global $client, $openAiApiKey;
 
     try {
-        $response = $client->post('https://api.openai.com/v1/chat/completions', [
+        $response = $client->post('https://api.openai.com/v1/completions', [
             'headers' => [
                 'Authorization' => "Bearer $openAiApiKey",
                 'Content-Type' => 'application/json',
             ],
             'json' => [
-                'model' => 'gpt-3.5-turbo',
-                'messages' => [
-                    [
-                        'role' => 'user',
-                        'content' => $prompt,
-                    ],
-                ],
-                'max_tokens' => 100,
+                'model' => 'text-davinci-003',
+                'prompt' => $prompt,
+                'max_tokens' => 150,
                 'temperature' => 0,
             ],
         ]);
 
         $data = json_decode($response->getBody(), true);
-        return $data['choices'][0]['message']['content'] ?? '';
+        return $data['choices'][0]['text'] ?? '';
 
     } catch (RequestException $e) {
         logError('OpenAI API Error: ' . $e->getMessage());
@@ -400,9 +345,9 @@ function formatReleaseDate($dateString)
 }
 
 // Function to get category IDs based on collection name
-function getCategoryIds($webhookData)
+function getCategoryIds()
 {
-    global $client, $shopwareApiUrl;
+    global $client, $shopwareApiUrl, $webhookData;
 
     $categoryName = $webhookData['collection']['name'] ?? 'Default Category';
     $token = getShopwareToken();
@@ -442,100 +387,11 @@ function getCategoryIds($webhookData)
     }
 }
 
-// Function to get currency ID
-function getCurrencyId($isoCode)
-{
-    global $client, $shopwareApiUrl;
-    $token = getShopwareToken();
-
-    try {
-        $response = $client->post("$shopwareApiUrl/api/search/currency", [
-            'headers' => [
-                'Authorization' => "Bearer $token",
-                'Content-Type' => 'application/json',
-            ],
-            'json' => [
-                'filter' => [
-                    [
-                        'type' => 'equals',
-                        'field' => 'isoCode',
-                        'value' => $isoCode,
-                    ],
-                ],
-                'includes' => ['id'],
-            ],
-        ]);
-
-        $data = json_decode($response->getBody(), true);
-
-        if (!empty($data['data'][0]['id'])) {
-            return $data['data'][0]['id'];
-        }
-
-        return null;
-
-    } catch (RequestException $e) {
-        logError('Error fetching currency ID: ' . $e->getMessage());
-        return null;
-    }
-}
-
-// Function to get manufacturer ID
-function getManufacturerId($manufacturerName)
-{
-    global $client, $shopwareApiUrl;
-    $token = getShopwareToken();
-
-    try {
-        // Check if manufacturer exists
-        $response = $client->post("$shopwareApiUrl/api/search/product-manufacturer", [
-            'headers' => [
-                'Authorization' => "Bearer $token",
-                'Content-Type' => 'application/json',
-            ],
-            'json' => [
-                'filter' => [
-                    [
-                        'type' => 'equals',
-                        'field' => 'name',
-                        'value' => $manufacturerName,
-                    ],
-                ],
-                'includes' => ['id'],
-            ],
-        ]);
-
-        $data = json_decode($response->getBody(), true);
-
-        if (!empty($data['data'][0]['id'])) {
-            return $data['data'][0]['id'];
-        } else {
-            // Create manufacturer
-            $manufacturerId = bin2hex(random_bytes(16));
-            $client->post("$shopwareApiUrl/api/product-manufacturer", [
-                'headers' => [
-                    'Authorization' => "Bearer $token",
-                    'Content-Type' => 'application/json',
-                ],
-                'json' => [
-                    'id' => $manufacturerId,
-                    'name' => $manufacturerName,
-                ],
-            ]);
-
-            return $manufacturerId;
-        }
-
-    } catch (RequestException $e) {
-        logError('Error fetching or creating manufacturer: ' . $e->getMessage());
-        return null;
-    }
-}
-
 // Function to get sales channel ID
-function getSalesChannelId($salesChannelName)
+function getSalesChannelId()
 {
-    global $client, $shopwareApiUrl;
+    global $client, $shopwareApiUrl, $salesChannelName;
+
     $token = getShopwareToken();
 
     try {
@@ -570,6 +426,45 @@ function getSalesChannelId($salesChannelName)
     }
 }
 
+// Function to get currency ID
+function getCurrencyId($isoCode)
+{
+    global $client, $shopwareApiUrl;
+
+    $token = getShopwareToken();
+
+    try {
+        $response = $client->post("$shopwareApiUrl/api/search/currency", [
+            'headers' => [
+                'Authorization' => "Bearer $token",
+                'Content-Type' => 'application/json',
+            ],
+            'json' => [
+                'filter' => [
+                    [
+                        'type' => 'equals',
+                        'field' => 'isoCode',
+                        'value' => $isoCode,
+                    ],
+                ],
+                'includes' => ['id'],
+            ],
+        ]);
+
+        $data = json_decode($response->getBody(), true);
+
+        if (!empty($data['data'][0]['id'])) {
+            return $data['data'][0]['id'];
+        }
+
+        return null;
+
+    } catch (RequestException $e) {
+        logError('Error fetching currency ID: ' . $e->getMessage());
+        return null;
+    }
+}
+
 // Function to get Shopware authentication token
 function getShopwareToken()
 {
@@ -578,7 +473,8 @@ function getShopwareToken()
     static $token = null;
     static $tokenExpiresAt = null;
 
-    if ($token && $tokenExpiresAt > time()) {
+    // Check if token is still valid
+    if ($token && $tokenExpiresAt && $tokenExpiresAt > time()) {
         return $token;
     }
 
@@ -593,8 +489,8 @@ function getShopwareToken()
 
         $data = json_decode($response->getBody(), true);
         $token = $data['access_token'];
-        $expiresIn = $data['expires_in'];
-        $tokenExpiresAt = time() + $expiresIn - 60; // Renew 60 seconds before expiry
+        $expiresIn = $data['expires_in'] ?? 0;
+        $tokenExpiresAt = time() + $expiresIn - 60; // Subtract 60 seconds as a buffer
 
         return $token;
 
@@ -620,19 +516,20 @@ function createProductInShopware($productData)
             // Set cover image
             if (!empty($mediaIds)) {
                 $productData['cover'] = ['mediaId' => $mediaIds[0]];
-                $productData['media'] = array_map(function($mediaId) {
+                $productData['media'] = array_map(function ($mediaId) {
                     return ['mediaId' => $mediaId];
                 }, $mediaIds);
             }
         }
 
         // Remove null values
-        $productData = array_filter($productData, function($value) {
+        $productData = array_filter($productData, function ($value) {
             return $value !== null;
         });
 
-        // Generate a unique product ID
-        $productData['id'] = bin2hex(random_bytes(16));
+        // Generate a unique ID for the product
+        $productId = uuid_create(UUID_TYPE_RANDOM);
+        $productData['id'] = $productId;
 
         // Create product
         $response = $client->post("$shopwareApiUrl/api/product", [
@@ -643,48 +540,11 @@ function createProductInShopware($productData)
             'json' => $productData,
         ]);
 
-        // Handle variants
-        if (isset($productData['variants'])) {
-            foreach ($productData['variants'] as $variantData) {
-                $variantData['parentId'] = $productData['id'];
-                createProductVariant($variantData);
-            }
-        }
-
+        $data = json_decode($response->getBody(), true);
         // Product created successfully
 
     } catch (RequestException $e) {
         logError('Error creating product: ' . $e->getMessage());
-    }
-}
-
-// Function to create product variant
-function createProductVariant($variantData)
-{
-    global $client, $shopwareApiUrl;
-
-    $token = getShopwareToken();
-
-    try {
-        // Remove null values
-        $variantData = array_filter($variantData, function($value) {
-            return $value !== null;
-        });
-
-        // Generate a unique product ID for the variant
-        $variantData['id'] = bin2hex(random_bytes(16));
-
-        // Create variant
-        $response = $client->post("$shopwareApiUrl/api/product", [
-            'headers' => [
-                'Authorization' => "Bearer $token",
-                'Content-Type' => 'application/json',
-            ],
-            'json' => $variantData,
-        ]);
-
-    } catch (RequestException $e) {
-        logError('Error creating product variant: ' . $e->getMessage());
     }
 }
 
@@ -697,7 +557,9 @@ function uploadImages($imageUrls, $token)
     foreach ($imageUrls as $imageUrl) {
         try {
             // Create media entity
-            $mediaId = bin2hex(random_bytes(16));
+            $mediaId = uuid_create(UUID_TYPE_RANDOM);
+
+            // Create media without a file first
             $client->post("$shopwareApiUrl/api/media", [
                 'headers' => [
                     'Authorization' => "Bearer $token",
@@ -708,26 +570,18 @@ function uploadImages($imageUrls, $token)
                 ],
             ]);
 
-            // Download the image content
-            $imageContent = file_get_contents($imageUrl);
-
-            if ($imageContent === false) {
-                logError('Error downloading image: ' . $imageUrl);
-                continue;
-            }
+            // Download image content
+            $imageResponse = $client->get($imageUrl);
+            $imageContent = $imageResponse->getBody()->getContents();
 
             // Upload the image
             $client->post("$shopwareApiUrl/api/_action/media/$mediaId/upload", [
                 'headers' => [
                     'Authorization' => "Bearer $token",
+                    'Content-Type' => 'application/octet-stream',
+                    'Content-Disposition' => 'form-data; name="file"; filename="' . basename($imageUrl) . '"',
                 ],
-                'multipart' => [
-                    [
-                        'name' => 'file',
-                        'contents' => $imageContent,
-                        'filename' => basename(parse_url($imageUrl, PHP_URL_PATH)),
-                    ],
-                ],
+                'body' => $imageContent,
             ]);
 
             $mediaIds[] = $mediaId;
@@ -741,7 +595,7 @@ function uploadImages($imageUrls, $token)
 }
 
 // Function to map variants
-function mapVariants($variants, $parentProductData)
+function mapVariants($variants)
 {
     global $customFieldsPrefix;
 
@@ -750,33 +604,30 @@ function mapVariants($variants, $parentProductData)
     foreach ($variants as $variant) {
         $variantData = [];
 
-        // Use the parent product data as a base
-        $variantData = $parentProductData;
-
-        // Override fields with variant-specific data
-        $variantData['productNumber'] = $variant['asin'] ?? '';
-        $variantData['name'] = $variant['text'] ?? $parentProductData['name'];
-
-        // Handle variant options (e.g., size, color)
-        // Assuming the variant dimensions are stored in 'dimensions'
-        if (isset($variant['dimensions'])) {
-            $variantData['customFields'][$customFieldsPrefix . 'variantDimensions'] = $variant['dimensions'];
+        // Options (e.g., size, color)
+        $options = [];
+        if (isset($variant['dimensions']) && is_array($variant['dimensions'])) {
+            foreach ($variant['dimensions'] as $dimension) {
+                if (isset($dimension['name'], $dimension['value'])) {
+                    $options[] = [
+                        'group' => $dimension['name'],
+                        'option' => $dimension['value'],
+                    ];
+                }
+            }
         }
 
-        // Prices
-        if (isset($variant['price']['value'])) {
-            $variantData['price'][0]['gross'] = $variant['price']['value'];
-            $variantData['price'][0]['net'] = $variant['price']['value'] / 1.19; // Assuming 19% VAT
-        }
+        // Custom fields
+        $customFields = [];
+        $customFields[$customFieldsPrefix . 'variantLink'] = $variant['link'] ?? null;
+        $customFields[$customFieldsPrefix . 'isCurrentProduct'] = $variant['is_current_product'] ?? null;
+        $customFields[$customFieldsPrefix . 'variantFormat'] = $variant['format'] ?? null;
+        $customFields[$customFieldsPrefix . 'priceInCart'] = $variant['price_only_available_in_cart'] ?? null;
 
-        // Additional variant-specific custom fields
-        $variantData['customFields'][$customFieldsPrefix . 'variantLink'] = $variant['link'] ?? null;
-        $variantData['customFields'][$customFieldsPrefix . 'isCurrentProduct'] = $variant['is_current_product'] ?? null;
-        $variantData['customFields'][$customFieldsPrefix . 'variantFormat'] = $variant['format'] ?? null;
-        $variantData['customFields'][$customFieldsPrefix . 'priceInCart'] = $variant['price_only_available_in_cart'] ?? null;
-
-        // Remove images from variant to avoid duplication
-        unset($variantData['images']);
+        $variantData['options'] = $options;
+        $variantData['customFields'] = array_filter($customFields, function ($value) {
+            return $value !== null;
+        });
 
         $mappedVariants[] = $variantData;
     }
@@ -800,7 +651,7 @@ function mapReviews($reviews, $productNumber)
         $reviewData['customerName'] = $review['profile']['name'] ?? 'Anonymous';
         $reviewData['createdAt'] = isset($review['date']['utc']) ? date('Y-m-d H:i:s', strtotime($review['date']['utc'])) : date('Y-m-d H:i:s');
         $reviewData['status'] = true;
-        $reviewData['productId'] = getProductIdByNumber($productNumber);
+        $reviewData['productId'] = $productNumber;
 
         // Custom fields
         $customFields = [];
@@ -808,7 +659,7 @@ function mapReviews($reviews, $productNumber)
         $customFields[$customFieldsPrefix . 'verifiedPurchase'] = $review['verified_purchase'] ?? null;
         $customFields[$customFieldsPrefix . 'helpfulVotes'] = $review['helpful_votes'] ?? null;
 
-        $reviewData['customFields'] = array_filter($customFields, function($value) {
+        $reviewData['customFields'] = array_filter($customFields, function ($value) {
             return $value !== null;
         });
 
@@ -816,66 +667,4 @@ function mapReviews($reviews, $productNumber)
     }
 
     return $mappedReviews;
-}
-
-// Function to get product ID by product number
-function getProductIdByNumber($productNumber)
-{
-    global $client, $shopwareApiUrl;
-
-    $token = getShopwareToken();
-
-    try {
-        $response = $client->post("$shopwareApiUrl/api/search/product", [
-            'headers' => [
-                'Authorization' => "Bearer $token",
-                'Content-Type' => 'application/json',
-            ],
-            'json' => [
-                'filter' => [
-                    [
-                        'type' => 'equals',
-                        'field' => 'productNumber',
-                        'value' => $productNumber,
-                    ],
-                ],
-                'includes' => ['id'],
-            ],
-        ]);
-
-        $data = json_decode($response->getBody(), true);
-
-        if (!empty($data['data'][0]['id'])) {
-            return $data['data'][0]['id'];
-        }
-
-        return null;
-
-    } catch (RequestException $e) {
-        logError('Error fetching product ID: ' . $e->getMessage());
-        return null;
-    }
-}
-
-// Function to create reviews in Shopware
-function createReviews($reviews)
-{
-    global $client, $shopwareApiUrl;
-
-    $token = getShopwareToken();
-
-    foreach ($reviews as $reviewData) {
-        try {
-            $client->post("$shopwareApiUrl/api/product-review", [
-                'headers' => [
-                    'Authorization' => "Bearer $token",
-                    'Content-Type' => 'application/json',
-                ],
-                'json' => $reviewData,
-            ]);
-
-        } catch (RequestException $e) {
-            logError('Error creating review: ' . $e->getMessage());
-        }
-    }
 }
