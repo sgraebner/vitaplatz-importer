@@ -23,23 +23,19 @@ $openAiApiKey = $_ENV['OPENAI_API_KEY'];
 // Initialize HTTP client
 $client = new Client();
 
-// Initialize error log
-$errorLog = [];
+// Initialize error log file
+$errorLogFile = 'error_log.txt';
+// Overwrite the error log file at the beginning
+file_put_contents($errorLogFile, '');
 
-// Function to log errors
+// Function to log errors immediately
 function logError($message)
 {
-    global $errorLog;
+    global $errorLogFile;
     $timestamp = date('Y-m-d H:i:s');
-    $errorLog[] = "[$timestamp] $message";
-}
-
-// Function to save error log to file
-function saveErrorLog()
-{
-    global $errorLog;
-    $logContent = implode(PHP_EOL, $errorLog);
-    file_put_contents('error_log.txt', $logContent);
+    $logMessage = "[$timestamp] $message" . PHP_EOL;
+    // Write the error message to the log file
+    file_put_contents($errorLogFile, $logMessage, FILE_APPEND);
 }
 
 // Handle incoming webhook request
@@ -51,7 +47,7 @@ try {
     }
 
     // Get the POST body
-    $requestBody = file_get_contents(STDIN);
+    $requestBody = file_get_contents('php://input');
     $webhookData = json_decode($requestBody, true);
 
     if (json_last_error() !== JSON_ERROR_NONE) {
@@ -73,16 +69,12 @@ try {
         processJsonPage($pageUrl);
     }
 
-    // Save error log after processing
-    saveErrorLog();
-
     // Respond to the webhook
     http_response_code(200);
     echo 'Webhook processed successfully';
 
 } catch (Exception $e) {
     logError($e->getMessage());
-    saveErrorLog();
     http_response_code(500);
     echo 'An error occurred: ' . $e->getMessage();
     exit;
