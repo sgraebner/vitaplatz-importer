@@ -51,7 +51,7 @@ try {
     }
 
     // Get the POST body
-    $requestBody = file_get_contents('php://input');
+    $requestBody = file_get_contents(STDIN);
     $webhookData = json_decode($requestBody, true);
 
     if (json_last_error() !== JSON_ERROR_NONE) {
