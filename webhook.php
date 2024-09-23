@@ -85,7 +85,7 @@ function logError($message)
     $errorLog[] = "[$timestamp] $message";
 }
  
-// Function to save error log to file.
+// Function to save error log to file .
 function saveErrorLog()
 {
     global $errorLog;
