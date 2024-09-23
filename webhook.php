@@ -6,6 +6,7 @@ require 'vendor/autoload.php';
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\RequestException;
 use Dotenv\Dotenv;
+use Ramsey\Uuid\Uuid; // Added for UUID generation
 
 // Load environment variables
 $dotenv = Dotenv::createImmutable(__DIR__);
@@ -527,8 +528,8 @@ function createProductInShopware($productData)
             return $value !== null;
         });
 
-        // Generate a unique ID for the product
-        $productId = uuid_create(UUID_TYPE_RANDOM);
+        // Generate a unique ID for the product using Ramsey UUID
+        $productId = Uuid::uuid4()->toString();
         $productData['id'] = $productId;
 
         // Create product
@@ -556,8 +557,8 @@ function uploadImages($imageUrls, $token)
 
     foreach ($imageUrls as $imageUrl) {
         try {
-            // Create media entity
-            $mediaId = uuid_create(UUID_TYPE_RANDOM);
+            // Generate a unique media ID
+            $mediaId = Uuid::uuid4()->toString();
 
             // Create media without a file first
             $client->post("$shopwareApiUrl/api/media", [
