@@ -19,6 +19,7 @@ $shopwareClientSecret = $_ENV['SHOPWARE_CLIENT_SECRET'] ?? '';
 $salesChannelName = $_ENV['SALES_CHANNEL_NAME'] ?? '';
 $customFieldsPrefix = $_ENV['CUSTOM_FIELDS_PREFIX'] ?? '';
 $openAiApiKey = $_ENV['OPENAI_API_KEY'] ?? '';
+$mediaFolderName = $_ENV['MEDIA_FOLDER_NAME'] ?? 'Default Media Folder';
 
 // Validate environment variables
 $requiredEnvVars = [
@@ -28,6 +29,7 @@ $requiredEnvVars = [
     'SALES_CHANNEL_NAME',
     'CUSTOM_FIELDS_PREFIX',
     'OPENAI_API_KEY',
+    'MEDIA_FOLDER_NAME',
 ];
 
 foreach ($requiredEnvVars as $envVar) {
@@ -50,14 +52,35 @@ $errorLogFile = 'error_log.txt';
 // Overwrite the error log file at the beginning
 file_put_contents($errorLogFile, '');
 
+// Initialize general log file
+$generalLogFile = 'general_log.txt';
+// Overwrite the general log file at the beginning
+file_put_contents($generalLogFile, '');
+
+// Common Guzzle headers
+$guzzleHeaders = [
+    'Content-Type' => 'application/json',
+    'Accept' => 'application/json',
+];
+
 // Function to log errors immediately
-function logError($message)
+function logError(string $message): void
 {
     global $errorLogFile;
     $timestamp = date('Y-m-d H:i:s');
-    $logMessage = "[$timestamp] $message" . PHP_EOL;
+    $logMessage = "[$timestamp] ERROR: $message" . PHP_EOL;
     // Write the error message to the log file
     file_put_contents($errorLogFile, $logMessage, FILE_APPEND);
+}
+
+// Function to log general messages
+function logMessage(string $message): void
+{
+    global $generalLogFile;
+    $timestamp = date('Y-m-d H:i:s');
+    $logMessage = "[$timestamp] INFO: $message" . PHP_EOL;
+    // Write the message to the log file
+    file_put_contents($generalLogFile, $logMessage, FILE_APPEND);
 }
 
 // Handle incoming webhook request
@@ -70,11 +93,10 @@ try {
 
     // Get the POST body
     $requestBody = file_get_contents('php://input');
-    $webhookData = json_decode($requestBody, true);
+    $webhookData = json_decode($requestBody, true, flags: JSON_THROW_ON_ERROR);
 
-    if (json_last_error() !== JSON_ERROR_NONE) {
-        throw new Exception('Invalid JSON in webhook payload: ' . json_last_error_msg());
-    }
+    // Log the received webhook data
+    logMessage('Received webhook data: ' . $requestBody);
 
     // Extract download links
     $downloadLinks = $webhookData['result_set']['download_links']['json']['pages'] ?? [];
@@ -103,22 +125,28 @@ try {
 }
 
 // Function to process a single JSON page
-function processJsonPage($pageUrl)
+function processJsonPage(string $pageUrl): void
 {
-    global $client;
+    global $client, $GLOBALS, $guzzleHeaders;
 
     try {
+        // Log the processing of the page
+        logMessage("Processing JSON page: $pageUrl");
+
         // Download the JSON page
         $response = $client->get($pageUrl);
-        $jsonData = json_decode($response->getBody(), true);
+        $jsonData = json_decode($response->getBody(), true, flags: JSON_THROW_ON_ERROR);
 
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            throw new Exception('Invalid JSON in downloaded page: ' . json_last_error_msg());
+        // Retrieve and store the category ID (only once)
+        if (!isset($GLOBALS['categoryId'])) {
+            $categoryId = getCategoryId();
+            $GLOBALS['categoryId'] = $categoryId;
+            logMessage("Category ID retrieved: $categoryId");
         }
 
         // Process each product in the JSON data
         foreach ($jsonData as $productData) {
-            if (!isset($productData['success']) || !$productData['success']) {
+            if (!($productData['success'] ?? false)) {
                 continue; // Skip unsuccessful entries
             }
 
@@ -139,11 +167,12 @@ function processJsonPage($pageUrl)
 }
 
 // Function to process a single product
-function processProduct($product)
+function processProduct(array $product): void
 {
-    global $client, $shopwareApiUrl, $salesChannelName, $customFieldsPrefix;
-
     try {
+        // Log the processing of the product
+        logMessage("Processing product with ASIN: " . ($product['asin'] ?? 'Unknown'));
+
         // Check if product already exists in Shopware
         $productNumber = $product['asin'] ?? null;
 
@@ -152,7 +181,7 @@ function processProduct($product)
         }
 
         if (productExistsInShopware($productNumber)) {
-            logError("Product with ASIN $productNumber already exists in Shopware.");
+            logMessage("Product with ASIN $productNumber already exists in Shopware.");
             return; // Skip existing products
         }
 
@@ -168,9 +197,9 @@ function processProduct($product)
 }
 
 // Function to check if a product exists in Shopware
-function productExistsInShopware($productNumber)
+function productExistsInShopware(string $productNumber): bool
 {
-    global $client, $shopwareApiUrl;
+    global $client, $shopwareApiUrl, $guzzleHeaders;
 
     // Get authentication token
     $token = getShopwareToken();
@@ -180,10 +209,9 @@ function productExistsInShopware($productNumber)
 
     try {
         $response = $client->post("$shopwareApiUrl/api/search/product", [
-            'headers' => [
+            'headers' => array_merge($guzzleHeaders, [
                 'Authorization' => "Bearer $token",
-                'Content-Type' => 'application/json',
-            ],
+            ]),
             'json' => [
                 'filter' => [
                     [
@@ -192,12 +220,14 @@ function productExistsInShopware($productNumber)
                         'value' => $productNumber,
                     ],
                 ],
-                'includes' => ['id'],
+                'includes' => [
+                    'product' => ['id']
+                ],
             ],
         ]);
 
-        $data = json_decode($response->getBody(), true);
-        return isset($data['total']) && $data['total'] > 0;
+        $data = json_decode($response->getBody(), true, flags: JSON_THROW_ON_ERROR);
+        return ($data['total'] ?? 0) > 0;
 
     } catch (RequestException $e) {
         logError('Error checking product existence: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
@@ -206,9 +236,9 @@ function productExistsInShopware($productNumber)
 }
 
 // Function to map product data from JSON to Shopware format
-function mapProductData($product)
+function mapProductData(array $product): array
 {
-    global $customFieldsPrefix;
+    global $customFieldsPrefix, $GLOBALS;
 
     $mappedData = [];
 
@@ -217,10 +247,18 @@ function mapProductData($product)
     $mappedData['name'] = $product['title'] ?? 'Unnamed Product';
     $mappedData['description'] = $product['description'] ?? '';
     $mappedData['releaseDate'] = isset($product['first_available']['raw']) ? formatReleaseDate($product['first_available']['raw']) : null;
-    $mappedData['manufacturer'] = $product['brand'] ?? 'Unknown';
     $mappedData['keywords'] = $product['keywords'] ?? '';
-    $mappedData['ratingAverage'] = $product['rating'] ?? null;
+    // Remove 'ratingAverage' as it's write-protected
+    // $mappedData['ratingAverage'] = $product['rating'] ?? null;
     $mappedData['ean'] = $product['ean'] ?? null;
+
+    // Get or create manufacturer and set manufacturerId
+    $manufacturerName = $product['brand'] ?? 'Unknown';
+    $manufacturerId = getManufacturerId($manufacturerName);
+    $mappedData['manufacturerId'] = $manufacturerId;
+
+    // Provide taxId
+    $mappedData['taxId'] = getDefaultTaxId();
 
     // Custom fields
     $customFields = [];
@@ -234,12 +272,12 @@ function mapProductData($product)
     $customFields[$customFieldsPrefix . 'isBundle'] = $product['is_bundle'] ?? null;
     // ... Add other custom fields as per mapping table
 
-    $mappedData['customFields'] = array_filter($customFields, function ($value) {
-        return $value !== null;
-    });
+    $mappedData['customFields'] = array_filter($customFields, fn($value) => $value !== null);
 
     // Dimensions and weight (standardize via OpenAI API)
-    $mappedData['weight'] = isset($product['weight']) ? standardizeUnits($product['weight'], 'weight') : null;
+    $weightValue = isset($product['weight']) ? standardizeUnits($product['weight'], 'weight') : null;
+    $mappedData['weight'] = is_numeric($weightValue) ? (float)$weightValue : null;
+
     $dimensions = isset($product['dimensions']) ? standardizeUnits($product['dimensions'], 'dimensions') : null;
 
     if ($dimensions) {
@@ -249,15 +287,22 @@ function mapProductData($product)
     }
 
     // Categories
-    $mappedData['categories'] = getCategoryIds();
+    $categoryId = $GLOBALS['categoryId'] ?? null;
+    if ($categoryId) {
+        $mappedData['categories'] = [['id' => $categoryId]];
+    }
 
     // Prices
     if (isset($product['buybox_winner']['price']['value'])) {
+        $grossPrice = $product['buybox_winner']['price']['value'];
+        $taxRate = getTaxRate(); // e.g., 19.0
+        $netPrice = $grossPrice / (1 + $taxRate / 100);
+
         $mappedData['price'] = [
             [
-                'currencyId' => getCurrencyId('USD'),
-                'gross' => $product['buybox_winner']['price']['value'],
-                'net' => $product['buybox_winner']['price']['value'] / 1.19, // Assuming 19% VAT
+                'currencyId' => getCurrencyId('EUR'), // Changed to EUR
+                'gross' => $grossPrice,
+                'net' => $netPrice,
                 'linked' => false,
             ]
         ];
@@ -281,9 +326,9 @@ function mapProductData($product)
     if (isset($product['main_image']['link'])) {
         $images[] = $product['main_image']['link'];
     }
-    if (isset($product['images']) && is_array($product['images'])) {
+    if (!empty($product['images']) && is_array($product['images'])) {
         foreach ($product['images'] as $image) {
-            if (isset($image['link'])) {
+            if (!empty($image['link'])) {
                 $images[] = $image['link'];
             }
         }
@@ -291,33 +336,37 @@ function mapProductData($product)
     $mappedData['images'] = $images;
 
     // Variants
-    if (isset($product['variants']) && is_array($product['variants'])) {
+    if (!empty($product['variants']) && is_array($product['variants'])) {
         $mappedData['configuratorSettings'] = mapVariants($product['variants']);
     }
 
     // Reviews
-    if (isset($product['top_reviews']) && is_array($product['top_reviews'])) {
+    if (!empty($product['top_reviews']) && is_array($product['top_reviews'])) {
         $mappedData['productReviews'] = mapReviews($product['top_reviews'], $mappedData['productNumber']);
     }
 
     // Remove null values from mapped data
-    $mappedData = array_filter($mappedData, function ($value) {
-        return $value !== null;
-    });
+    $mappedData = array_filter($mappedData, fn($value) => $value !== null);
+
+    // Log the mapped product data
+    logMessage("Mapped product data for ASIN {$mappedData['productNumber']}: " . json_encode($mappedData));
 
     // Return the mapped data
     return $mappedData;
 }
 
 // Function to standardize units using OpenAI API
-function standardizeUnits($value, $type)
+function standardizeUnits(string $value, string $type): mixed
 {
-    global $openAiApiKey;
-
     // Prepare the prompt
-    $prompt = "Convert the following $type to standard units compatible with Shopware 6, and provide the result as JSON only without explanation:\n\n$value";
+    $prompt = "Convert the following $type to standard units compatible with Shopware 6, and provide the result as JSON only without any code block markers or additional text:\n\n$value";
 
     $response = callOpenAiApi($prompt);
+
+    // Clean up the response by removing any code block markers
+    $response = trim($response);
+    $response = preg_replace('/^```(?:json)?\s*/', '', $response); // Remove starting ```json or ```
+    $response = preg_replace('/\s*```$/', '', $response); // Remove ending ```
 
     // Parse the JSON response
     $standardizedData = json_decode($response, true);
@@ -327,31 +376,48 @@ function standardizeUnits($value, $type)
         return null;
     }
 
+    // Log the standardized units
+    logMessage("Standardized $type: " . json_encode($standardizedData));
+
+    if ($type === 'weight') {
+        return $standardizedData['weight'] ?? null;
+    }
+
     return $standardizedData;
 }
 
 // Function to call OpenAI API
-function callOpenAiApi($prompt)
+function callOpenAiApi(string $prompt): string
 {
-    global $client, $openAiApiKey;
+    global $client, $openAiApiKey, $guzzleHeaders;
 
     try {
-        $response = $client->post('https://api.openai.com/v1/completions', [
-            'headers' => [
+        $response = $client->post('https://api.openai.com/v1/chat/completions', [
+            'headers' => array_merge($guzzleHeaders, [
                 'Authorization' => "Bearer $openAiApiKey",
-                'Content-Type' => 'application/json',
-            ],
+            ]),
             'json' => [
-                'model' => 'text-davinci-003',
-                'prompt' => $prompt,
+                'model' => 'gpt-4o-mini', // Use the specified model
+                'messages' => [
+                    [
+                        'role' => 'user',
+                        'content' => $prompt,
+                    ]
+                ],
                 'max_tokens' => 150,
                 'temperature' => 0,
             ],
         ]);
 
-        $data = json_decode($response->getBody(), true);
-        if (isset($data['choices'][0]['text'])) {
-            return $data['choices'][0]['text'];
+        $data = json_decode($response->getBody(), true, flags: JSON_THROW_ON_ERROR);
+
+        if (isset($data['choices'][0]['message']['content'])) {
+            $apiResponse = $data['choices'][0]['message']['content'];
+
+            // Log the raw response
+            logMessage("OpenAI API response: $apiResponse");
+
+            return $apiResponse;
         } else {
             throw new Exception('Invalid response from OpenAI API');
         }
@@ -363,65 +429,79 @@ function callOpenAiApi($prompt)
 }
 
 // Function to format release date
-function formatReleaseDate($dateString)
+function formatReleaseDate(string $dateString): ?string
 {
     $date = date_create_from_format('F j, Y', $dateString);
-    if ($date) {
-        return $date->format('Y-m-d H:i:s');
-    }
-    return null;
+    return $date ? $date->format('Y-m-d H:i:s') : null;
 }
 
-// Function to get category IDs based on collection name
-function getCategoryIds()
+// Function to get category ID based on customFields
+function getCategoryId(): string
 {
-    global $client, $shopwareApiUrl, $webhookData;
+    global $client, $shopwareApiUrl, $webhookData, $guzzleHeaders;
 
-    $categoryName = $webhookData['collection']['name'] ?? 'Default Category';
+    $collectionId = $webhookData['collection']['id'] ?? null;
+    if (!$collectionId) {
+        throw new Exception('Collection ID is missing in webhook data.');
+    }
+
     $token = getShopwareToken();
     if (!$token) {
         throw new Exception('Unable to obtain Shopware token.');
     }
 
     try {
+        logMessage("Searching for category with customFields matching collection ID $collectionId");
+
         $response = $client->post("$shopwareApiUrl/api/search/category", [
-            'headers' => [
+            'headers' => array_merge($guzzleHeaders, [
                 'Authorization' => "Bearer $token",
-                'Content-Type' => 'application/json',
-            ],
+            ]),
             'json' => [
                 'filter' => [
                     [
                         'type' => 'equals',
-                        'field' => 'name',
-                        'value' => $categoryName,
+                        'field' => 'customFields.junu_category_collection',
+                        'value' => true,
+                    ],
+                    [
+                        'type' => 'equals',
+                        'field' => 'customFields.junu_category_collection_id',
+                        'value' => $collectionId,
                     ],
                 ],
-                'includes' => ['id'],
+                'includes' => [
+                    'category' => ['id']
+                ],
             ],
         ]);
 
-        $data = json_decode($response->getBody(), true);
-        $categoryIds = [];
+        $data = json_decode($response->getBody(), true, flags: JSON_THROW_ON_ERROR);
 
         if (!empty($data['data'])) {
-            foreach ($data['data'] as $category) {
-                $categoryIds[] = ['id' => $category['id']];
-            }
+            $categoryId = $data['data'][0]['id'];
+            logMessage("Found matching category ID: $categoryId");
+            return $categoryId;
+        } else {
+            throw new Exception('No matching category found.');
         }
 
-        return $categoryIds;
-
     } catch (RequestException $e) {
-        logError('Error fetching category IDs: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
-        return [];
+        logError('Error fetching category ID: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
+        throw $e;
     }
 }
 
 // Function to get sales channel ID
-function getSalesChannelId()
+function getSalesChannelId(): ?string
 {
-    global $client, $shopwareApiUrl, $salesChannelName;
+    global $client, $shopwareApiUrl, $salesChannelName, $guzzleHeaders;
+
+    static $salesChannelId = null;
+
+    if ($salesChannelId) {
+        return $salesChannelId;
+    }
 
     $token = getShopwareToken();
     if (!$token) {
@@ -430,10 +510,9 @@ function getSalesChannelId()
 
     try {
         $response = $client->post("$shopwareApiUrl/api/search/sales-channel", [
-            'headers' => [
+            'headers' => array_merge($guzzleHeaders, [
                 'Authorization' => "Bearer $token",
-                'Content-Type' => 'application/json',
-            ],
+            ]),
             'json' => [
                 'filter' => [
                     [
@@ -442,14 +521,17 @@ function getSalesChannelId()
                         'value' => $salesChannelName,
                     ],
                 ],
-                'includes' => ['id'],
+                'includes' => [
+                    'sales_channel' => ['id']
+                ],
             ],
         ]);
 
-        $data = json_decode($response->getBody(), true);
+        $data = json_decode($response->getBody(), true, flags: JSON_THROW_ON_ERROR);
 
         if (!empty($data['data'][0]['id'])) {
-            return $data['data'][0]['id'];
+            $salesChannelId = $data['data'][0]['id'];
+            return $salesChannelId;
         }
 
         throw new Exception('Sales channel not found.');
@@ -461,9 +543,15 @@ function getSalesChannelId()
 }
 
 // Function to get currency ID
-function getCurrencyId($isoCode)
+function getCurrencyId(string $isoCode): string
 {
-    global $client, $shopwareApiUrl;
+    global $client, $shopwareApiUrl, $guzzleHeaders;
+
+    static $currencyIds = [];
+
+    if (isset($currencyIds[$isoCode])) {
+        return $currencyIds[$isoCode];
+    }
 
     $token = getShopwareToken();
     if (!$token) {
@@ -472,10 +560,9 @@ function getCurrencyId($isoCode)
 
     try {
         $response = $client->post("$shopwareApiUrl/api/search/currency", [
-            'headers' => [
+            'headers' => array_merge($guzzleHeaders, [
                 'Authorization' => "Bearer $token",
-                'Content-Type' => 'application/json',
-            ],
+            ]),
             'json' => [
                 'filter' => [
                     [
@@ -484,28 +571,91 @@ function getCurrencyId($isoCode)
                         'value' => $isoCode,
                     ],
                 ],
-                'includes' => ['id'],
+                'includes' => [
+                    'currency' => ['id']
+                ],
             ],
         ]);
 
-        $data = json_decode($response->getBody(), true);
+        $data = json_decode($response->getBody(), true, flags: JSON_THROW_ON_ERROR);
 
         if (!empty($data['data'][0]['id'])) {
-            return $data['data'][0]['id'];
+            $currencyId = $data['data'][0]['id'];
+            $currencyIds[$isoCode] = $currencyId;
+            return $currencyId;
         }
 
         throw new Exception('Currency not found.');
 
     } catch (RequestException $e) {
         logError('Error fetching currency ID: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
-        return null;
+        return '';
+    }
+}
+
+// Function to get default tax ID
+function getDefaultTaxId(): string
+{
+    global $client, $shopwareApiUrl, $guzzleHeaders;
+
+    static $defaultTaxId = null;
+
+    if ($defaultTaxId) {
+        return $defaultTaxId;
+    }
+
+    $token = getShopwareToken();
+    if (!$token) {
+        throw new Exception('Unable to obtain Shopware token.');
+    }
+
+    try {
+        // Fetch the default tax rate (e.g., 19% VAT)
+        $response = $client->post("$shopwareApiUrl/api/search/tax", [
+            'headers' => array_merge($guzzleHeaders, [
+                'Authorization' => "Bearer $token",
+            ]),
+            'json' => [
+                'filter' => [
+                    ['type' => 'equals', 'field' => 'taxRate', 'value' => 19.0],
+                ],
+                'includes' => [
+                    'tax' => ['id', 'taxRate'],
+                ],
+            ],
+        ]);
+
+        $data = json_decode($response->getBody(), true, flags: JSON_THROW_ON_ERROR);
+
+        if (!empty($data['data'][0]['id'])) {
+            $defaultTaxId = $data['data'][0]['id'];
+            // Store the tax rate for price calculations
+            $GLOBALS['defaultTaxRate'] = $data['data'][0]['taxRate'];
+            return $defaultTaxId;
+        } else {
+            throw new Exception('Default tax rate not found.');
+        }
+    } catch (RequestException $e) {
+        logError('Error fetching default tax ID: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
+        throw $e;
+    }
+}
+
+// Function to get default tax rate
+function getTaxRate(): float
+{
+    if (isset($GLOBALS['defaultTaxRate'])) {
+        return $GLOBALS['defaultTaxRate'];
+    } else {
+        getDefaultTaxId(); // This will set $GLOBALS['defaultTaxRate']
+        return $GLOBALS['defaultTaxRate'] ?? 19.0;
     }
 }
 
 // Function to get Shopware authentication token
-function getShopwareToken()
+function getShopwareToken(): ?string
 {
-    global $client, $shopwareApiUrl, $shopwareClientId, $shopwareClientSecret;
+    global $client, $shopwareApiUrl, $shopwareClientId, $shopwareClientSecret, $guzzleHeaders;
 
     static $token = null;
     static $tokenExpiresAt = null;
@@ -522,9 +672,12 @@ function getShopwareToken()
                 'client_id' => $shopwareClientId,
                 'client_secret' => $shopwareClientSecret,
             ],
+            'headers' => [
+                'Accept' => 'application/json',
+            ],
         ]);
 
-        $data = json_decode($response->getBody(), true);
+        $data = json_decode($response->getBody(), true, flags: JSON_THROW_ON_ERROR);
         if (isset($data['access_token'])) {
             $token = $data['access_token'];
             $expiresIn = $data['expires_in'] ?? 0;
@@ -541,10 +694,236 @@ function getShopwareToken()
     }
 }
 
-// Function to create product in Shopware
-function createProductInShopware($productData)
+// Function to get or create media folder ID
+function getMediaFolderId(): string
 {
-    global $client, $shopwareApiUrl;
+    global $client, $shopwareApiUrl, $mediaFolderName, $guzzleHeaders;
+
+    static $mediaFolderId = null;
+
+    if ($mediaFolderId) {
+        return $mediaFolderId;
+    }
+
+    $token = getShopwareToken();
+    if (!$token) {
+        throw new Exception('Unable to obtain Shopware token.');
+    }
+
+    try {
+        // Search for the media folder by name
+        $response = $client->post("$shopwareApiUrl/api/search/media-folder", [
+            'headers' => array_merge($guzzleHeaders, [
+                'Authorization' => "Bearer $token",
+            ]),
+            'json' => [
+                'filter' => [
+                    [
+                        'type' => 'equals',
+                        'field' => 'name',
+                        'value' => $mediaFolderName,
+                    ],
+                ],
+                'includes' => [
+                    'media_folder' => ['id']
+                ],
+            ],
+        ]);
+
+        $data = json_decode($response->getBody(), true, flags: JSON_THROW_ON_ERROR);
+
+        if (!empty($data['data'][0]['id'])) {
+            $mediaFolderId = $data['data'][0]['id'];
+            return $mediaFolderId;
+        } else {
+            // Media folder does not exist, create it
+            $mediaFolderId = createMediaFolder();
+            return $mediaFolderId;
+        }
+
+    } catch (RequestException $e) {
+        logError('Error fetching media folder ID: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
+        throw $e;
+    }
+}
+
+// Function to create media folder
+function createMediaFolder(): string
+{
+    global $client, $shopwareApiUrl, $mediaFolderName, $guzzleHeaders;
+
+    $token = getShopwareToken();
+    if (!$token) {
+        throw new Exception('Unable to obtain Shopware token.');
+    }
+
+    try {
+        // Get default configuration ID for media folders
+        $configurationId = getDefaultMediaFolderConfigurationId();
+
+        // Generate a valid UUID without dashes
+        $mediaFolderId = Uuid::uuid4()->getHex();
+
+        $client->post("$shopwareApiUrl/api/media-folder", [
+            'headers' => array_merge($guzzleHeaders, [
+                'Authorization' => "Bearer $token",
+            ]),
+            'json' => [
+                'id' => $mediaFolderId,
+                'name' => $mediaFolderName,
+                'useParentConfiguration' => true,
+                'configurationId' => $configurationId,
+            ],
+        ]);
+
+        logMessage("Media folder created with ID: $mediaFolderId");
+
+        return $mediaFolderId;
+
+    } catch (RequestException $e) {
+        logError('Error creating media folder: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
+        throw $e;
+    }
+}
+
+// Function to get default media folder configuration ID
+function getDefaultMediaFolderConfigurationId(): string
+{
+    global $client, $shopwareApiUrl, $guzzleHeaders;
+
+    static $configurationId = null;
+
+    if ($configurationId) {
+        return $configurationId;
+    }
+
+    $token = getShopwareToken();
+    if (!$token) {
+        throw new Exception('Unable to obtain Shopware token.');
+    }
+
+    try {
+        $response = $client->post("$shopwareApiUrl/api/search/media-folder-configuration", [
+            'headers' => array_merge($guzzleHeaders, [
+                'Authorization' => "Bearer $token",
+            ]),
+            'json' => [
+                'limit' => 1,
+                'includes' => [
+                    'media_folder_configuration' => ['id']
+                ],
+            ],
+        ]);
+
+        $data = json_decode($response->getBody(), true, flags: JSON_THROW_ON_ERROR);
+
+        if (!empty($data['data'][0]['id'])) {
+            $configurationId = $data['data'][0]['id'];
+            return $configurationId;
+        } else {
+            throw new Exception('No media folder configuration found.');
+        }
+
+    } catch (RequestException $e) {
+        logError('Error fetching media folder configuration ID: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
+        throw $e;
+    }
+}
+
+// Function to get or create manufacturer
+function getManufacturerId(string $manufacturerName): string
+{
+    global $client, $shopwareApiUrl, $guzzleHeaders;
+
+    static $manufacturerCache = [];
+
+    if (isset($manufacturerCache[$manufacturerName])) {
+        return $manufacturerCache[$manufacturerName];
+    }
+
+    $token = getShopwareToken();
+    if (!$token) {
+        throw new Exception('Unable to obtain Shopware token.');
+    }
+
+    try {
+        // Search for the manufacturer by name
+        $response = $client->post("$shopwareApiUrl/api/search/product-manufacturer", [
+            'headers' => array_merge($guzzleHeaders, [
+                'Authorization' => "Bearer $token",
+            ]),
+            'json' => [
+                'filter' => [
+                    [
+                        'type' => 'equals',
+                        'field' => 'name',
+                        'value' => $manufacturerName,
+                    ],
+                ],
+                'includes' => [
+                    'product_manufacturer' => ['id'],
+                ],
+            ],
+        ]);
+
+        $data = json_decode($response->getBody(), true, flags: JSON_THROW_ON_ERROR);
+
+        if (!empty($data['data'][0]['id'])) {
+            // Manufacturer exists, return its ID
+            $manufacturerId = $data['data'][0]['id'];
+        } else {
+            // Manufacturer doesn't exist, create it
+            $manufacturerId = createManufacturer($manufacturerName);
+        }
+
+        // Cache the manufacturer ID
+        $manufacturerCache[$manufacturerName] = $manufacturerId;
+
+        return $manufacturerId;
+    } catch (RequestException $e) {
+        logError('Error fetching manufacturer ID: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
+        throw $e;
+    }
+}
+
+// Function to create manufacturer
+function createManufacturer(string $manufacturerName): string
+{
+    global $client, $shopwareApiUrl, $guzzleHeaders;
+
+    $token = getShopwareToken();
+    if (!$token) {
+        throw new Exception('Unable to obtain Shopware token.');
+    }
+
+    try {
+        // Generate a unique ID for the manufacturer
+        $manufacturerId = Uuid::uuid4()->getHex();
+
+        // Create the manufacturer
+        $client->post("$shopwareApiUrl/api/product-manufacturer", [
+            'headers' => array_merge($guzzleHeaders, [
+                'Authorization' => "Bearer $token",
+            ]),
+            'json' => [
+                'id' => $manufacturerId,
+                'name' => $manufacturerName,
+            ],
+        ]);
+
+        logMessage("Manufacturer '$manufacturerName' created with ID: $manufacturerId");
+
+        return $manufacturerId;
+    } catch (RequestException $e) {
+        logError('Error creating manufacturer: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
+        throw $e;
+    }
+}
+
+// Function to create product in Shopware
+function createProductInShopware(array $productData): void
+{
+    global $client, $shopwareApiUrl, $guzzleHeaders;
 
     $token = getShopwareToken();
     if (!$token) {
@@ -560,33 +939,27 @@ function createProductInShopware($productData)
             // Set cover image
             if (!empty($mediaIds)) {
                 $productData['cover'] = ['mediaId' => $mediaIds[0]];
-                $productData['media'] = array_map(function ($mediaId) {
-                    return ['mediaId' => $mediaId];
-                }, $mediaIds);
+                $productData['media'] = array_map(fn($mediaId) => ['mediaId' => $mediaId], $mediaIds);
             }
         }
 
         // Remove null values
-        $productData = array_filter($productData, function ($value) {
-            return $value !== null;
-        });
+        $productData = array_filter($productData, fn($value) => $value !== null);
 
         // Generate a unique ID for the product using Ramsey UUID
-        $productId = Uuid::uuid4()->toString();
+        $productId = Uuid::uuid4()->getHex();
         $productData['id'] = $productId;
 
         // Create product
-        $response = $client->post("$shopwareApiUrl/api/product", [
-            'headers' => [
+        $client->post("$shopwareApiUrl/api/product", [
+            'headers' => array_merge($guzzleHeaders, [
                 'Authorization' => "Bearer $token",
-                'Content-Type' => 'application/json',
-            ],
-            'json' => $productData,
+            ]),
+            'json' => $productData, // Send product data directly, not as an array
         ]);
 
-        $data = json_decode($response->getBody(), true);
         // Product created successfully
-        logError("Product created successfully with ID $productId");
+        logMessage("Product created successfully with ID $productId");
 
     } catch (RequestException $e) {
         $responseBody = $e->hasResponse() ? $e->getResponse()->getBody()->getContents() : 'No response body';
@@ -594,58 +967,119 @@ function createProductInShopware($productData)
     }
 }
 
-// Function to upload images to Shopware
-function uploadImages($imageUrls, $token)
+
+// Function to upload images to Shopware using URL
+function uploadImages(array $imageUrls, string $token): array
 {
-    global $client, $shopwareApiUrl;
+    global $client, $shopwareApiUrl, $guzzleHeaders;
+
+    $mediaFolderId = getMediaFolderId();
     $mediaIds = [];
 
     foreach ($imageUrls as $imageUrl) {
         try {
-            // Generate a unique media ID
-            $mediaId = Uuid::uuid4()->toString();
+            // Extract filename from image URL
+            $filename = basename(parse_url($imageUrl, PHP_URL_PATH));
+            $fileNameWithoutExtension = pathinfo($filename, PATHINFO_FILENAME);
 
-            // Create media without a file first
-            $client->post("$shopwareApiUrl/api/media", [
-                'headers' => [
+            // Check if media with this filename already exists
+            $existingMediaId = findMediaByFilename($fileNameWithoutExtension, $token);
+            if ($existingMediaId) {
+                logMessage("Media with filename $filename already exists with ID: $existingMediaId");
+                $mediaIds[] = $existingMediaId;
+                continue;
+            }
+
+            // Generate a unique media ID (32-character hex without dashes)
+            $mediaId = Uuid::uuid4()->getHex();
+
+            // Create media entity with mediaFolderId and id
+            $response = $client->post("$shopwareApiUrl/api/media", [
+                'headers' => array_merge($guzzleHeaders, [
                     'Authorization' => "Bearer $token",
-                    'Content-Type' => 'application/json',
-                ],
+                ]),
                 'json' => [
                     'id' => $mediaId,
+                    'mediaFolderId' => $mediaFolderId,
+                    // 'alt' => 'Optional alt text', // Add alt text if available
                 ],
             ]);
 
-            // Download image content
-            $imageResponse = $client->get($imageUrl);
-            $imageContent = $imageResponse->getBody()->getContents();
+            if ($response->getStatusCode() !== 204) {
+                $responseBody = $response->getBody()->getContents();
+                throw new Exception("Failed to create media entity. Response: $responseBody");
+            }
 
-            // Upload the image
-            $client->post("$shopwareApiUrl/api/_action/media/$mediaId/upload", [
-                'headers' => [
+            // Upload the image by providing the URL
+            // Include 'fileName' as a query parameter
+            $uploadUrl = "$shopwareApiUrl/api/_action/media/$mediaId/upload?fileName=" . urlencode($fileNameWithoutExtension);
+
+            $uploadResponse = $client->post($uploadUrl, [
+                'headers' => array_merge($guzzleHeaders, [
                     'Authorization' => "Bearer $token",
-                ],
-                'multipart' => [
-                    [
-                        'name'     => 'file',
-                        'contents' => $imageContent,
-                        'filename' => basename($imageUrl),
-                    ],
+                ]),
+                'json' => [
+                    'url' => $imageUrl,
                 ],
             ]);
+
+            if ($uploadResponse->getStatusCode() !== 204) {
+                $responseBody = $uploadResponse->getBody()->getContents();
+                throw new Exception("Failed to upload media. Response: $responseBody");
+            }
 
             $mediaIds[] = $mediaId;
 
+            // Log successful image upload
+            logMessage("Uploaded image: $imageUrl with media ID: $mediaId");
+
         } catch (RequestException $e) {
-            logError('Error uploading image: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
+            $responseBody = $e->hasResponse() ? $e->getResponse()->getBody()->getContents() : 'No response body';
+            logError('Error uploading image: ' . $e->getMessage() . "\nResponse Body: $responseBody\n" . $e->getTraceAsString());
+        } catch (Exception $e) {
+            logError('Error uploading image: ' . $e->getMessage());
         }
     }
 
     return $mediaIds;
 }
 
+// Function to find existing media by filename
+function findMediaByFilename(string $fileNameWithoutExtension, string $token): ?string
+{
+    global $client, $shopwareApiUrl, $guzzleHeaders;
+
+    try {
+        $response = $client->post("$shopwareApiUrl/api/search/media", [
+            'headers' => array_merge($guzzleHeaders, [
+                'Authorization' => "Bearer $token",
+            ]),
+            'json' => [
+                'filter' => [
+                    [
+                        'type' => 'equals',
+                        'field' => 'fileName',
+                        'value' => $fileNameWithoutExtension,
+                    ],
+                ],
+                'includes' => [
+                    'media' => ['id'],
+                ],
+            ],
+        ]);
+
+        $data = json_decode($response->getBody(), true, flags: JSON_THROW_ON_ERROR);
+
+        return $data['data'][0]['id'] ?? null;
+
+    } catch (RequestException $e) {
+        logError('Error searching for media by filename: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
+        return null;
+    }
+}
+
 // Function to map variants
-function mapVariants($variants)
+function mapVariants(array $variants): array
 {
     global $customFieldsPrefix;
 
@@ -656,12 +1090,18 @@ function mapVariants($variants)
 
         // Options (e.g., size, color)
         $options = [];
-        if (isset($variant['dimensions']) && is_array($variant['dimensions'])) {
+        if (!empty($variant['dimensions']) && is_array($variant['dimensions'])) {
             foreach ($variant['dimensions'] as $dimension) {
-                if (isset($dimension['name'], $dimension['value'])) {
+                if (!empty($dimension['name']) && !empty($dimension['value'])) {
+                    $groupName = $dimension['name'];
+                    $optionName = $dimension['value'];
+
+                    // Get or create option group and option
+                    $groupId = getOptionGroupId($groupName);
+                    $optionId = getOptionId($groupId, $optionName);
+
                     $options[] = [
-                        'group' => $dimension['name'],
-                        'option' => $dimension['value'],
+                        'optionId' => $optionId,
                     ];
                 }
             }
@@ -675,9 +1115,7 @@ function mapVariants($variants)
         $customFields[$customFieldsPrefix . 'priceInCart'] = $variant['price_only_available_in_cart'] ?? null;
 
         $variantData['options'] = $options;
-        $variantData['customFields'] = array_filter($customFields, function ($value) {
-            return $value !== null;
-        });
+        $variantData['customFields'] = array_filter($customFields, fn($value) => $value !== null);
 
         $mappedVariants[] = $variantData;
     }
@@ -685,10 +1123,135 @@ function mapVariants($variants)
     return $mappedVariants;
 }
 
+// Function to get or create option group
+function getOptionGroupId(string $groupName): string
+{
+    global $client, $shopwareApiUrl, $guzzleHeaders;
+
+    static $optionGroupCache = [];
+
+    if (isset($optionGroupCache[$groupName])) {
+        return $optionGroupCache[$groupName];
+    }
+
+    $token = getShopwareToken();
+    if (!$token) {
+        throw new Exception('Unable to obtain Shopware token.');
+    }
+
+    try {
+        // Search for existing property group
+        $response = $client->post("$shopwareApiUrl/api/search/property-group", [
+            'headers' => array_merge($guzzleHeaders, [
+                'Authorization' => "Bearer $token",
+            ]),
+            'json' => [
+                'filter' => [
+                    ['type' => 'equals', 'field' => 'name', 'value' => $groupName],
+                ],
+                'includes' => [
+                    'property_group' => ['id'],
+                ],
+            ],
+        ]);
+
+        $data = json_decode($response->getBody(), true, flags: JSON_THROW_ON_ERROR);
+
+        if (!empty($data['data'][0]['id'])) {
+            $groupId = $data['data'][0]['id'];
+        } else {
+            // Create new property group
+            $groupId = Uuid::uuid4()->getHex();
+
+            $client->post("$shopwareApiUrl/api/property-group", [
+                'headers' => array_merge($guzzleHeaders, [
+                    'Authorization' => "Bearer $token",
+                ]),
+                'json' => [
+                    'id'   => $groupId,
+                    'name' => $groupName,
+                ],
+            ]);
+        }
+
+        $optionGroupCache[$groupName] = $groupId;
+        return $groupId;
+
+    } catch (RequestException $e) {
+        logError('Error fetching or creating option group: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
+        throw $e;
+    }
+}
+
+// Function to get or create option
+function getOptionId(string $groupId, string $optionName): string
+{
+    global $client, $shopwareApiUrl, $guzzleHeaders;
+
+    static $optionCache = [];
+
+    $cacheKey = $groupId . '_' . $optionName;
+    if (isset($optionCache[$cacheKey])) {
+        return $optionCache[$cacheKey];
+    }
+
+    $token = getShopwareToken();
+    if (!$token) {
+        throw new Exception('Unable to obtain Shopware token.');
+    }
+
+    try {
+        // Search for existing property group option
+        $response = $client->post("$shopwareApiUrl/api/search/property-group-option", [
+            'headers' => array_merge($guzzleHeaders, [
+                'Authorization' => "Bearer $token",
+            ]),
+            'json' => [
+                'filter' => [
+                    ['type' => 'equals', 'field' => 'name', 'value' => $optionName],
+                    ['type' => 'equals', 'field' => 'groupId', 'value' => $groupId],
+                ],
+                'includes' => [
+                    'property_group_option' => ['id'],
+                ],
+            ],
+        ]);
+
+        $data = json_decode($response->getBody(), true, flags: JSON_THROW_ON_ERROR);
+
+        if (!empty($data['data'][0]['id'])) {
+            $optionId = $data['data'][0]['id'];
+        } else {
+            // Create new property group option
+            $optionId = Uuid::uuid4()->getHex();
+
+            $client->post("$shopwareApiUrl/api/property-group-option", [
+                'headers' => array_merge($guzzleHeaders, [
+                    'Authorization' => "Bearer $token",
+                ]),
+                'json' => [
+                    'id'      => $optionId,
+                    'groupId' => $groupId,
+                    'name'    => $optionName,
+                ],
+            ]);
+        }
+
+        $optionCache[$cacheKey] = $optionId;
+        return $optionId;
+
+    } catch (RequestException $e) {
+        logError('Error fetching or creating option: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
+        throw $e;
+    }
+}
+
 // Function to map reviews
-function mapReviews($reviews, $productNumber)
+function mapReviews(array $reviews, string $productId): array
 {
     global $customFieldsPrefix;
+
+    $salesChannelId = getSalesChannelId();
 
     $mappedReviews = [];
 
@@ -701,7 +1264,8 @@ function mapReviews($reviews, $productNumber)
         $reviewData['customerName'] = $review['profile']['name'] ?? 'Anonymous';
         $reviewData['createdAt'] = isset($review['date']['utc']) ? date('Y-m-d H:i:s', strtotime($review['date']['utc'])) : date('Y-m-d H:i:s');
         $reviewData['status'] = true;
-        $reviewData['productId'] = $productNumber;
+        $reviewData['productId'] = $productId;
+        $reviewData['salesChannelId'] = $salesChannelId;
 
         // Custom fields
         $customFields = [];
@@ -709,9 +1273,7 @@ function mapReviews($reviews, $productNumber)
         $customFields[$customFieldsPrefix . 'verifiedPurchase'] = $review['verified_purchase'] ?? null;
         $customFields[$customFieldsPrefix . 'helpfulVotes'] = $review['helpful_votes'] ?? null;
 
-        $reviewData['customFields'] = array_filter($customFields, function ($value) {
-            return $value !== null;
-        });
+        $reviewData['customFields'] = array_filter($customFields, fn($value) => $value !== null);
 
         $mappedReviews[] = $reviewData;
     }
