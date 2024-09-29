@@ -6,22 +6,44 @@ require 'vendor/autoload.php';
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\RequestException;
 use Dotenv\Dotenv;
-use Ramsey\Uuid\Uuid; // Added for UUID generation
+use Ramsey\Uuid\Uuid;
 
 // Load environment variables
 $dotenv = Dotenv::createImmutable(__DIR__);
 $dotenv->load();
 
 // Configuration
-$shopwareApiUrl = rtrim($_ENV['SHOPWARE_API_URL'], '/');
-$shopwareClientId = $_ENV['SHOPWARE_CLIENT_ID'];
-$shopwareClientSecret = $_ENV['SHOPWARE_CLIENT_SECRET'];
-$salesChannelName = $_ENV['SALES_CHANNEL_NAME'];
-$customFieldsPrefix = $_ENV['CUSTOM_FIELDS_PREFIX'];
-$openAiApiKey = $_ENV['OPENAI_API_KEY'];
+$shopwareApiUrl = rtrim($_ENV['SHOPWARE_API_URL'] ?? '', '/');
+$shopwareClientId = $_ENV['SHOPWARE_CLIENT_ID'] ?? '';
+$shopwareClientSecret = $_ENV['SHOPWARE_CLIENT_SECRET'] ?? '';
+$salesChannelName = $_ENV['SALES_CHANNEL_NAME'] ?? '';
+$customFieldsPrefix = $_ENV['CUSTOM_FIELDS_PREFIX'] ?? '';
+$openAiApiKey = $_ENV['OPENAI_API_KEY'] ?? '';
 
-// Initialize HTTP client
-$client = new Client();
+// Validate environment variables
+$requiredEnvVars = [
+    'SHOPWARE_API_URL',
+    'SHOPWARE_CLIENT_ID',
+    'SHOPWARE_CLIENT_SECRET',
+    'SALES_CHANNEL_NAME',
+    'CUSTOM_FIELDS_PREFIX',
+    'OPENAI_API_KEY',
+];
+
+foreach ($requiredEnvVars as $envVar) {
+    if (empty($_ENV[$envVar])) {
+        http_response_code(500);
+        echo "Environment variable $envVar is not set.";
+        exit;
+    }
+}
+
+// Initialize HTTP client with timeouts and retries
+$client = new Client([
+    'timeout' => 30,
+    'connect_timeout' => 10,
+    'retry_on_timeout' => true,
+]);
 
 // Initialize error log file
 $errorLogFile = 'error_log.txt';
@@ -51,7 +73,7 @@ try {
     $webhookData = json_decode($requestBody, true);
 
     if (json_last_error() !== JSON_ERROR_NONE) {
-        throw new Exception('Invalid JSON in webhook payload');
+        throw new Exception('Invalid JSON in webhook payload: ' . json_last_error_msg());
     }
 
     // Extract download links
@@ -74,7 +96,7 @@ try {
     echo 'Webhook processed successfully';
 
 } catch (Exception $e) {
-    logError($e->getMessage());
+    logError($e->getMessage() . "\n" . $e->getTraceAsString());
     http_response_code(500);
     echo 'An error occurred: ' . $e->getMessage();
     exit;
@@ -83,7 +105,7 @@ try {
 // Function to process a single JSON page
 function processJsonPage($pageUrl)
 {
-    global $client, $shopwareApiUrl, $shopwareClientId, $shopwareClientSecret, $salesChannelName, $customFieldsPrefix, $openAiApiKey;
+    global $client;
 
     try {
         // Download the JSON page
@@ -91,12 +113,12 @@ function processJsonPage($pageUrl)
         $jsonData = json_decode($response->getBody(), true);
 
         if (json_last_error() !== JSON_ERROR_NONE) {
-            throw new Exception('Invalid JSON in downloaded page');
+            throw new Exception('Invalid JSON in downloaded page: ' . json_last_error_msg());
         }
 
         // Process each product in the JSON data
         foreach ($jsonData as $productData) {
-            if (!$productData['success']) {
+            if (!isset($productData['success']) || !$productData['success']) {
                 continue; // Skip unsuccessful entries
             }
 
@@ -110,9 +132,9 @@ function processJsonPage($pageUrl)
         }
 
     } catch (RequestException $e) {
-        logError('HTTP Request Error: ' . $e->getMessage());
+        logError('HTTP Request Error: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
     } catch (Exception $e) {
-        logError('Processing Error: ' . $e->getMessage());
+        logError('Processing Error: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
     }
 }
 
@@ -130,6 +152,7 @@ function processProduct($product)
         }
 
         if (productExistsInShopware($productNumber)) {
+            logError("Product with ASIN $productNumber already exists in Shopware.");
             return; // Skip existing products
         }
 
@@ -140,7 +163,7 @@ function processProduct($product)
         createProductInShopware($shopwareProductData);
 
     } catch (Exception $e) {
-        logError('Product Processing Error: ' . $e->getMessage());
+        logError('Product Processing Error: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
     }
 }
 
@@ -151,6 +174,9 @@ function productExistsInShopware($productNumber)
 
     // Get authentication token
     $token = getShopwareToken();
+    if (!$token) {
+        throw new Exception('Unable to obtain Shopware token.');
+    }
 
     try {
         $response = $client->post("$shopwareApiUrl/api/search/product", [
@@ -171,10 +197,10 @@ function productExistsInShopware($productNumber)
         ]);
 
         $data = json_decode($response->getBody(), true);
-        return $data['total'] > 0;
+        return isset($data['total']) && $data['total'] > 0;
 
     } catch (RequestException $e) {
-        logError('Error checking product existence: ' . $e->getMessage());
+        logError('Error checking product existence: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
         return false;
     }
 }
@@ -274,6 +300,11 @@ function mapProductData($product)
         $mappedData['productReviews'] = mapReviews($product['top_reviews'], $mappedData['productNumber']);
     }
 
+    // Remove null values from mapped data
+    $mappedData = array_filter($mappedData, function ($value) {
+        return $value !== null;
+    });
+
     // Return the mapped data
     return $mappedData;
 }
@@ -292,7 +323,7 @@ function standardizeUnits($value, $type)
     $standardizedData = json_decode($response, true);
 
     if (json_last_error() !== JSON_ERROR_NONE) {
-        logError('Error parsing OpenAI response: ' . json_last_error_msg());
+        logError('Error parsing OpenAI response: ' . json_last_error_msg() . "\nResponse: $response");
         return null;
     }
 
@@ -319,10 +350,14 @@ function callOpenAiApi($prompt)
         ]);
 
         $data = json_decode($response->getBody(), true);
-        return $data['choices'][0]['text'] ?? '';
+        if (isset($data['choices'][0]['text'])) {
+            return $data['choices'][0]['text'];
+        } else {
+            throw new Exception('Invalid response from OpenAI API');
+        }
 
     } catch (RequestException $e) {
-        logError('OpenAI API Error: ' . $e->getMessage());
+        logError('OpenAI API Error: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
         return '';
     }
 }
@@ -344,6 +379,9 @@ function getCategoryIds()
 
     $categoryName = $webhookData['collection']['name'] ?? 'Default Category';
     $token = getShopwareToken();
+    if (!$token) {
+        throw new Exception('Unable to obtain Shopware token.');
+    }
 
     try {
         $response = $client->post("$shopwareApiUrl/api/search/category", [
@@ -375,7 +413,7 @@ function getCategoryIds()
         return $categoryIds;
 
     } catch (RequestException $e) {
-        logError('Error fetching category IDs: ' . $e->getMessage());
+        logError('Error fetching category IDs: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
         return [];
     }
 }
@@ -386,6 +424,9 @@ function getSalesChannelId()
     global $client, $shopwareApiUrl, $salesChannelName;
 
     $token = getShopwareToken();
+    if (!$token) {
+        throw new Exception('Unable to obtain Shopware token.');
+    }
 
     try {
         $response = $client->post("$shopwareApiUrl/api/search/sales-channel", [
@@ -411,10 +452,10 @@ function getSalesChannelId()
             return $data['data'][0]['id'];
         }
 
-        return null;
+        throw new Exception('Sales channel not found.');
 
     } catch (RequestException $e) {
-        logError('Error fetching sales channel ID: ' . $e->getMessage());
+        logError('Error fetching sales channel ID: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
         return null;
     }
 }
@@ -425,6 +466,9 @@ function getCurrencyId($isoCode)
     global $client, $shopwareApiUrl;
 
     $token = getShopwareToken();
+    if (!$token) {
+        throw new Exception('Unable to obtain Shopware token.');
+    }
 
     try {
         $response = $client->post("$shopwareApiUrl/api/search/currency", [
@@ -450,10 +494,10 @@ function getCurrencyId($isoCode)
             return $data['data'][0]['id'];
         }
 
-        return null;
+        throw new Exception('Currency not found.');
 
     } catch (RequestException $e) {
-        logError('Error fetching currency ID: ' . $e->getMessage());
+        logError('Error fetching currency ID: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
         return null;
     }
 }
@@ -481,14 +525,18 @@ function getShopwareToken()
         ]);
 
         $data = json_decode($response->getBody(), true);
-        $token = $data['access_token'];
-        $expiresIn = $data['expires_in'] ?? 0;
-        $tokenExpiresAt = time() + $expiresIn - 60; // Subtract 60 seconds as a buffer
+        if (isset($data['access_token'])) {
+            $token = $data['access_token'];
+            $expiresIn = $data['expires_in'] ?? 0;
+            $tokenExpiresAt = time() + $expiresIn - 60; // Subtract 60 seconds as a buffer
 
-        return $token;
+            return $token;
+        } else {
+            throw new Exception('Invalid response from Shopware token endpoint.');
+        }
 
     } catch (RequestException $e) {
-        logError('Error obtaining Shopware token: ' . $e->getMessage());
+        logError('Error obtaining Shopware token: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
         return null;
     }
 }
@@ -499,6 +547,9 @@ function createProductInShopware($productData)
     global $client, $shopwareApiUrl;
 
     $token = getShopwareToken();
+    if (!$token) {
+        throw new Exception('Unable to obtain Shopware token.');
+    }
 
     try {
         // Upload images and get media IDs
@@ -535,9 +586,11 @@ function createProductInShopware($productData)
 
         $data = json_decode($response->getBody(), true);
         // Product created successfully
+        logError("Product created successfully with ID $productId");
 
     } catch (RequestException $e) {
-        logError('Error creating product: ' . $e->getMessage());
+        $responseBody = $e->hasResponse() ? $e->getResponse()->getBody()->getContents() : 'No response body';
+        logError('Error creating product: ' . $e->getMessage() . "\nResponse Body: $responseBody\n" . $e->getTraceAsString());
     }
 }
 
@@ -571,16 +624,20 @@ function uploadImages($imageUrls, $token)
             $client->post("$shopwareApiUrl/api/_action/media/$mediaId/upload", [
                 'headers' => [
                     'Authorization' => "Bearer $token",
-                    'Content-Type' => 'application/octet-stream',
-                    'Content-Disposition' => 'form-data; name="file"; filename="' . basename($imageUrl) . '"',
                 ],
-                'body' => $imageContent,
+                'multipart' => [
+                    [
+                        'name'     => 'file',
+                        'contents' => $imageContent,
+                        'filename' => basename($imageUrl),
+                    ],
+                ],
             ]);
 
             $mediaIds[] = $mediaId;
 
         } catch (RequestException $e) {
-            logError('Error uploading image: ' . $e->getMessage());
+            logError('Error uploading image: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
         }
     }
 
