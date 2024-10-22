@@ -1,7 +1,23 @@
 {
+    "name": "ju-nu/vitaplatz-importer",
+    "description": "A script to import products into Shopware 6 using data from webhooks and APIs.",
+    "type": "project",
     "require": {
         "guzzlehttp/guzzle": "^7.0",
-        "vlucas/phpdotenv": "^5.4",
-        "ramsey/uuid": "^4.2"
+        "vlucas/phpdotenv": "^5.0",
+        "ramsey/uuid": "^4.0",
+        "mozex/anthropic-php": "^1.0",
+        "ext-json": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "JUNU\\": "src/"
+        }
+    },
+    "minimum-stability": "stable",
+    "config": {
+        "allow-plugins": {
+            "php-http/discovery": true
+        }
     }
 }

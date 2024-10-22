@@ -1,3 +1,17 @@
-vendor/
+# Ignore composer dependencies
+/vendor/
+/test/
+
+# Ignore environment variables
 .env
+
+# Ignore composer lock file
 composer.lock
+
+# Ignore logs
+error_log.txt
+general_log.txt
+
+# Ignore other temporary files
+.DS_Store
+Thumbs.db
