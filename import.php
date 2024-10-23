@@ -331,6 +331,7 @@ function mapProductData(array $product): array
     $customFields[$customFieldsPrefix . 'ratingsTotal']   = $product['ratings_total'] ?? null;
     $customFields[$customFieldsPrefix . 'reviewsTotal']   = $product['reviews_total'] ?? null;
     $customFields[$customFieldsPrefix . 'isBundle']       = $product['is_bundle'] ?? null;
+    $customFields[$customFieldsPrefix . 'lastUpdate']     = (new \DateTime())->format('c');
     // ... Add other custom fields as per mapping table
 
     if (!empty($product['feature_bullets']) && is_array($product['feature_bullets'])) {
