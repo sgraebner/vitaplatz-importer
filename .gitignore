@@ -1,6 +1,7 @@
 # Ignore composer dependencies
 /vendor/
 /test/
+/processing/
 
 # Ignore environment variables
 .env
