@@ -5,6 +5,9 @@ declare(strict_types=1);
 ini_set('display_errors', '1');
 error_reporting(E_ALL);
 
+// Increase the maximum execution time if needed
+set_time_limit(0);
+
 // Get the raw POST data
 $rawPostData = file_get_contents('php://input');
 
@@ -24,21 +27,42 @@ if (!$collectionId) {
     exit("Collection ID is missing in the webhook data.");
 }
 
+// Send immediate response to the webhook initiator
+http_response_code(200);
+echo "Webhook received successfully.";
+
+// Flush the output buffers and close the connection to the client
+if (function_exists('fastcgi_finish_request')) {
+    // Available in PHP-FPM
+    session_write_close();
+    fastcgi_finish_request();
+} else {
+    // Fallback for other SAPIs
+    ignore_user_abort(true);
+    @ob_end_flush();
+    @ob_flush();
+    @flush();
+}
+
+// Now continue processing in the background
+
 // Create the directory path
 $directoryPath = __DIR__ . '/processing/' . $collectionId;
 
 // Create the directory if it doesn't exist
 if (!is_dir($directoryPath) && !mkdir($directoryPath, 0777, true)) {
-    http_response_code(500); // Internal Server Error
-    exit("Failed to create directory: $directoryPath");
+    // Log the error
+    error_log("Failed to create directory: $directoryPath");
+    exit;
 }
 
 // Get the list of page URLs
 $pageUrls = $data['result_set']['download_links']['json']['pages'] ?? [];
 
 if (empty($pageUrls)) {
-    http_response_code(400); // Bad Request
-    exit("No page URLs found in the webhook data.");
+    // Log the error
+    error_log("No page URLs found in the webhook data.");
+    exit;
 }
 
 try {
@@ -53,12 +77,13 @@ try {
         downloadFile($pageUrl, $savePath);
     }
 
-    http_response_code(200); // OK
-    echo "Files downloaded successfully.";
+    // Optionally, log success
+    error_log("Files downloaded successfully for collection ID: $collectionId.");
 
 } catch (Exception $e) {
-    http_response_code(500); // Internal Server Error
-    exit("An error occurred: " . $e->getMessage());
+    // Log any exceptions during the download process
+    error_log("An error occurred: " . $e->getMessage());
+    exit;
 }
 
 /**
@@ -84,7 +109,7 @@ function downloadFile(string $url, string $savePath): void
         CURLOPT_FOLLOWLOCATION  => true,
         CURLOPT_FAILONERROR     => true,
         CURLOPT_CONNECTTIMEOUT  => 10,
-        CURLOPT_TIMEOUT         => 60,
+        CURLOPT_TIMEOUT         => 300,
         CURLOPT_USERAGENT       => 'WebhookDownloader/1.0',
     ]);
 
