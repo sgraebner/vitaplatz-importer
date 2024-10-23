@@ -318,6 +318,7 @@ function mapProductData(array $product): array
         if (strlen($mappedData['name']) > 255) {
             $mappedData['name'] = substr($mappedData['name'], 0, 252) . '...';
         }
+        $customFields['customFields.twt_modern_pro_custom_field__product__short_description']     = $mappedData['metaDescription']; // TWT CUSTOM FIELD
     } else {
         $mappedData['description']     = $product['description'] ?? '';
     }
