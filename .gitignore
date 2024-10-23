@@ -9,9 +9,8 @@
 composer.lock
 
 # Ignore logs
-.txt
+*.txt
 
 # Ignore other temporary files
 .DS_Store
 Thumbs.db
-general_log.txt
