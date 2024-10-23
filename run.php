@@ -86,6 +86,9 @@ function enforceRateLimit(): void
         }
     );
 
+    // Reindex the array to ensure indices start from 0
+    $rateLimiter['request_timestamps'] = array_values($rateLimiter['request_timestamps']);
+
     if (count($rateLimiter['request_timestamps']) > $rateLimiter['max_requests']) {
         // Calculate sleep time
         $oldestRequest = $rateLimiter['request_timestamps'][0];
@@ -96,6 +99,7 @@ function enforceRateLimit(): void
         }
     }
 }
+
 
 // Function to log errors immediately
 function logError(string $message): void
