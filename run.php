@@ -138,15 +138,18 @@ try {
         // The collection ID is the folder name
         $collectionId = basename($collectionDir);
 
-        // Set $webhookData accordingly
+        // Set webhook data accordingly
         $webhookData = [
             'collection' => [
                 'id' => $collectionId,
             ],
         ];
 
-        // Set webhook data globally for access in other functions
+        // Set webhook data globally for access in other functions (if needed)
         $GLOBALS['webhookData'] = $webhookData;
+
+        // **Reset the global categoryId for the new collection**
+        unset($GLOBALS['categoryId']); // or $GLOBALS['categoryId'] = null;
 
         // Get the list of JSON files in the collection directory
         $jsonFiles = glob($collectionDir . '/*.json');
@@ -176,6 +179,7 @@ try {
     logError($e->getMessage() . "\n" . $e->getTraceAsString());
     exit('An error occurred: ' . $e->getMessage());
 }
+
 
 // Function to process a single JSON file
 function processJsonFile(string $filePath): void
