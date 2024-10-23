@@ -36,8 +36,9 @@ $requiredEnvVars = [
 
 foreach ($requiredEnvVars as $envVar) {
     if (empty($_ENV[$envVar])) {
+        http_response_code(500);
         echo "Environment variable $envVar is not set.";
-        exit(1);
+        exit;
     }
 }
 
@@ -117,74 +118,64 @@ function logMessage(string $message): void
     file_put_contents($generalLogFile, $logMessage, FILE_APPEND);
 }
 
-// Main processing loop
+// Handle incoming webhook request
 try {
-    $processingDir = __DIR__ . '/processing';
-
-    // Check if processing directory exists
-    if (!is_dir($processingDir)) {
-        throw new Exception("Processing directory not found: $processingDir");
+    // Ensure the request is a POST
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        http_response_code(405);
+        exit('Method Not Allowed');
     }
 
-    // Get list of subdirectories (collection ids)
-    $collectionDirs = array_filter(glob($processingDir . '/*'), 'is_dir');
+    // Get the POST body
+    $requestBody = file_get_contents('php://input');
+    $webhookData = json_decode($requestBody, true, flags: JSON_THROW_ON_ERROR);
 
-    if (empty($collectionDirs)) {
-        logMessage("No collections found in processing directory.");
-        exit;
+    // Log the received webhook data
+    logMessage('Received webhook data: ' . $requestBody);
+
+    // Extract download links
+    $downloadLinks = $webhookData['result_set']['download_links']['json']['pages'] ?? [];
+
+    if (empty($downloadLinks)) {
+        throw new Exception('No download links found in webhook payload');
     }
 
-    foreach ($collectionDirs as $collectionDir) {
-        // Get the collection id from directory name
-        $collectionId = basename($collectionDir);
+    // Set webhook data globally for access in other functions
+    $GLOBALS['webhookData'] = $webhookData;
 
-        logMessage("Processing collection: $collectionId");
-
-        // Store collectionId globally for access in other functions
-        $GLOBALS['collectionId'] = $collectionId;
-
-        // Get list of JSON files in the collection directory
-        $jsonFiles = glob($collectionDir . '/*.json');
-
-        if (empty($jsonFiles)) {
-            logMessage("No JSON files found in collection directory: $collectionDir");
-            // Optionally delete the empty collection directory
-            // rmdir($collectionDir);
-            continue;
-        }
-
-        foreach ($jsonFiles as $jsonFile) {
-            processJsonFile($jsonFile);
-            // Delete the JSON file after processing
-            unlink($jsonFile);
-        }
-
-        // After processing all JSON files, check if directory is empty
-        if (count(glob($collectionDir . '/*')) === 0) {
-            // Delete the collection directory
-            rmdir($collectionDir);
-            logMessage("Deleted empty collection directory: $collectionDir");
-        }
+    // Process each JSON page sequentially
+    foreach ($downloadLinks as $pageUrl) {
+        processJsonPage($pageUrl);
     }
+
+    // Respond to the webhook
+    http_response_code(200);
+    echo 'Webhook processed successfully';
 
 } catch (Exception $e) {
     logError($e->getMessage() . "\n" . $e->getTraceAsString());
-    exit('An error occurred: ' . $e->getMessage());
+    http_response_code(500);
+    echo 'An error occurred: ' . $e->getMessage();
+    exit;
 }
 
-// Function to process a single JSON file
-function processJsonFile(string $filePath): void
+// Function to process a single JSON page
+function processJsonPage(string $pageUrl): void
 {
     global $client, $GLOBALS, $guzzleHeaders;
 
     try {
-        // Log the processing of the file
-        logMessage("Processing JSON file: $filePath");
+        // Log the processing of the page
+        logMessage("Processing JSON page: $pageUrl");
 
-        // Read the JSON file
-        $jsonData = json_decode(file_get_contents($filePath), true, flags: JSON_THROW_ON_ERROR);
+        // Download the JSON page
+        $response = apiRequestWithRetry(function () use ($client, $pageUrl) {
+            return $client->get($pageUrl);
+        });
 
-        // Retrieve and store the category ID (only once per collection)
+        $jsonData = json_decode($response->getBody(), true, flags: JSON_THROW_ON_ERROR);
+
+        // Retrieve and store the category ID (only once)
         if (!isset($GLOBALS['categoryId'])) {
             $categoryId            = getCategoryId();
             $GLOBALS['categoryId'] = $categoryId;
@@ -206,6 +197,8 @@ function processJsonFile(string $filePath): void
             processProduct($productResult);
         }
 
+    } catch (RequestException $e) {
+        logError('HTTP Request Error: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
     } catch (Exception $e) {
         logError('Processing Error: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
     }
@@ -286,165 +279,160 @@ function productExistsInShopware(string $productNumber): bool
 // Function to map product data from JSON to Shopware format
 function mapProductData(array $product): array
 {
-    try {
-        global $customFieldsPrefix, $GLOBALS;
+    global $customFieldsPrefix, $GLOBALS;
 
-        $mappedData = [];
+    $mappedData = [];
 
-        // Basic fields
-        $mappedData['productNumber'] = $product['asin'] ?? '';
-        $mappedData['name']          = $product['title'] ?? 'Unnamed Product';
-        $mappedData['ean']           = $product['ean'] ?? null;
+    // Basic fields
+    $mappedData['productNumber'] = $product['asin'] ?? '';
+    $mappedData['name']          = $product['title'] ?? 'Unnamed Product';
+    $mappedData['ean']           = $product['ean'] ?? null;
 
-        // Generate product and meta descriptions using Anthropic AI
-        $generatedDescriptions = generateDescriptions($product['title'], $product['keywords'] ?? '');
+    // Generate product and meta descriptions using Anthropic AI
+    $generatedDescriptions = generateDescriptions($product['title'], $product['keywords'] ?? '');
 
-        if ($generatedDescriptions) {
-            $mappedData['name']            = $generatedDescriptions['newTitle'];
-            $mappedData['description']     = $generatedDescriptions['productDescription'];
-            $mappedData['metaDescription'] = $generatedDescriptions['metaDescription'];
-
-            // Ensure metaDescription does not exceed 255 characters
-            if (strlen($mappedData['metaDescription']) > 255) {
-                $mappedData['metaDescription'] = substr($mappedData['metaDescription'], 0, 252) . '...';
-            }
-            if (strlen($mappedData['name']) > 255) {
-                $mappedData['name'] = substr($mappedData['name'], 0, 252) . '...';
-            }
-        } else {
-            $mappedData['description']     = $product['description'] ?? '';
+    if ($generatedDescriptions) {
+        $mappedData['name']            = $generatedDescriptions['newTitle'];
+        $mappedData['description']     = $generatedDescriptions['productDescription'];
+        $mappedData['metaDescription'] = $generatedDescriptions['metaDescription'];
+    
+        // Ensure metaDescription does not exceed 255 characters
+        if (strlen($mappedData['metaDescription']) > 255) {
+            $mappedData['metaDescription'] = substr($mappedData['metaDescription'], 0, 252) . '...';
         }
-
-        $mappedData['releaseDate'] = isset($product['first_available']['raw']) ? formatReleaseDate($product['first_available']['raw']) : null;
-
-        $mappedData['keywords'] = $product['keywords'] ?? '';
-        $mappedData['customSearchKeywords'] = $product['keywords_list'] ?? [];
-
-        // Get or create manufacturer and set manufacturerId
-        $manufacturerName             = $product['brand'] ?? 'Unknown';
-        $manufacturerId               = getManufacturerId($manufacturerName);
-        $mappedData['manufacturerId'] = $manufacturerId;
-
-        // Provide taxId
-        $mappedData['taxId'] = getDefaultTaxId();
-
-        // Custom fields
-        $customFields = [];
-        $customFields[$customFieldsPrefix . 'parentAsin']     = $product['parent_asin'] ?? null;
-        $customFields[$customFieldsPrefix . 'productLink']    = $product['link'] ?? null;
-        $customFields[$customFieldsPrefix . 'shippingWeight'] = $product['shipping_weight'] ?? null;
-        $customFields[$customFieldsPrefix . 'deliveryMessage'] = $product['delivery_message'] ?? null;
-        $customFields[$customFieldsPrefix . 'subTitle']       = $product['sub_title']['text'] ?? null;
-        $customFields[$customFieldsPrefix . 'ratingsTotal']   = $product['ratings_total'] ?? null;
-        $customFields[$customFieldsPrefix . 'reviewsTotal']   = $product['reviews_total'] ?? null;
-        $customFields[$customFieldsPrefix . 'isBundle']       = $product['is_bundle'] ?? null;
-        $customFields[$customFieldsPrefix . 'lastUpdate']     = (new \DateTime())->format('c');
-        // ... Add other custom fields as per mapping table
-
-        if (!empty($product['feature_bullets']) && is_array($product['feature_bullets'])) {
-            $featureBulletsHtml = '<ul>';
-            foreach ($product['feature_bullets'] as $bullet) {
-                $featureBulletsHtml .= '<li>' . htmlspecialchars($bullet, ENT_QUOTES, 'UTF-8') . '</li>';
-            }
-            $featureBulletsHtml .= '</ul>';
-            $customFields[$customFieldsPrefix . 'features'] = $featureBulletsHtml;
+        if (strlen($mappedData['name']) > 255) {
+            $mappedData['name'] = substr($mappedData['name'], 0, 252) . '...';
         }
-
-        // Set imported and anthropic custom fields to true
-        $customFields[$customFieldsPrefix . 'imported']  = true;
-        $customFields[$customFieldsPrefix . 'anthropic'] = true;
-
-        $mappedData['customFields'] = array_filter($customFields, fn($value) => $value !== null);
-
-        // Dimensions and weight (standardize via OpenAI API)
-        $weightValue          = isset($product['weight']) ? standardizeUnits($product['weight'], 'weight') : null;
-        $mappedData['weight'] = is_numeric($weightValue) ? (float)$weightValue : null;
-
-        $dimensions = isset($product['dimensions']) ? standardizeUnits($product['dimensions'], 'dimensions') : null;
-
-        if ($dimensions) {
-            $mappedData['length'] = $dimensions['length'] ?? null;
-            $mappedData['width']  = $dimensions['width'] ?? null;
-            $mappedData['height'] = $dimensions['height'] ?? null;
-        }
-
-        // Categories
-        $categoryId = $GLOBALS['categoryId'] ?? null;
-        if ($categoryId) {
-            $mappedData['categories'] = [['id' => $categoryId]];
-        }
-
-        // Prices
-        if (isset($product['buybox_winner']['price']['value'])) {
-            $grossPrice = $product['buybox_winner']['price']['value'];
-            $taxRate    = getTaxRate(); // e.g., 19.0
-            $netPrice   = $grossPrice / (1 + $taxRate / 100);
-
-            $mappedData['price'] = [
-                [
-                    'currencyId' => getCurrencyId('EUR'),
-                    'gross'      => $grossPrice,
-                    'net'        => $netPrice,
-                    'linked'     => false,
-                ]
-            ];
-        }
-
-        // Stock and availability
-        $availabilityType     = $product['buybox_winner']['availability']['type'] ?? 'out_of_stock';
-        $mappedData['stock']  = $availabilityType === 'in_stock' ? 100 : 0;
-        $mappedData['active'] = $availabilityType === 'in_stock';
-
-        // Sales channel assignment
-        $mappedData['visibilities'] = [
-            [
-                'salesChannelId' => getSalesChannelId(),
-                'visibility'     => 30, // Visibility all
-            ],
-        ];
-
-        // Images
-        $images = [];
-        if (isset($product['main_image']['link'])) {
-            $images[] = $product['main_image']['link'];
-        }
-        if (!empty($product['images']) && is_array($product['images'])) {
-            foreach ($product['images'] as $image) {
-                if (!empty($image['link'])) {
-                    $images[] = $image['link'];
-                }
-            }
-        }
-        $mappedData['images'] = $images;
-
-        // Variants
-        if (!empty($product['variants']) && is_array($product['variants'])) {
-            $mappedData['configuratorSettings'] = mapVariants($product['variants']);
-        }
-
-        // Properties
-        if (!empty($product['attributes']) && is_array($product['attributes'])) {
-            $mappedData['properties'] = mapProperties($product['attributes']);
-        }
-
-        // Reviews
-        if (!empty($product['top_reviews']) && is_array($product['top_reviews'])) {
-            $mappedData['productReviews'] = mapReviews($product['top_reviews'], $mappedData['productNumber']);
-        }
-
-        // Remove null values from mapped data
-        $mappedData = array_filter($mappedData, fn($value) => $value !== null);
-
-        // Log the mapped product data
-        logMessage("Mapped product data for ASIN {$mappedData['productNumber']}: " . json_encode($mappedData));
-
-        // Return the mapped data
-        return $mappedData;
-
-    } catch (Exception $e) {
-        logError('Error in mapProductData: ' . $e->getMessage());
-        return [];
+    } else {
+        $mappedData['description']     = $product['description'] ?? '';
     }
+    
+
+    $mappedData['releaseDate'] = isset($product['first_available']['raw']) ? formatReleaseDate($product['first_available']['raw']) : null;
+
+    $mappedData['keywords'] = $product['keywords']?? '';
+    $mappedData['customSearchKeywords'] = $product['keywords_list'] ?? [];
+
+    // Get or create manufacturer and set manufacturerId
+    $manufacturerName             = $product['brand'] ?? 'Unknown';
+    $manufacturerId               = getManufacturerId($manufacturerName);
+    $mappedData['manufacturerId'] = $manufacturerId;
+
+    // Provide taxId
+    $mappedData['taxId'] = getDefaultTaxId();
+
+    // Custom fields
+    $customFields = [];
+    $customFields[$customFieldsPrefix . 'parentAsin']     = $product['parent_asin'] ?? null;
+    $customFields[$customFieldsPrefix . 'productLink']    = $product['link'] ?? null;
+    $customFields[$customFieldsPrefix . 'shippingWeight'] = $product['shipping_weight'] ?? null;
+    $customFields[$customFieldsPrefix . 'deliveryMessage'] = $product['delivery_message'] ?? null;
+    $customFields[$customFieldsPrefix . 'subTitle']       = $product['sub_title']['text'] ?? null;
+    $customFields[$customFieldsPrefix . 'ratingsTotal']   = $product['ratings_total'] ?? null;
+    $customFields[$customFieldsPrefix . 'reviewsTotal']   = $product['reviews_total'] ?? null;
+    $customFields[$customFieldsPrefix . 'isBundle']       = $product['is_bundle'] ?? null;
+    $customFields[$customFieldsPrefix . 'lastUpdate']     = (new \DateTime())->format('c');
+    // ... Add other custom fields as per mapping table
+
+    if (!empty($product['feature_bullets']) && is_array($product['feature_bullets'])) {
+        $featureBulletsHtml = '<ul>';
+        foreach ($product['feature_bullets'] as $bullet) {
+            $featureBulletsHtml .= '<li>' . htmlspecialchars($bullet, ENT_QUOTES, 'UTF-8') . '</li>';
+        }
+        $featureBulletsHtml .= '</ul>';
+        $customFields[$customFieldsPrefix . 'features'] = $featureBulletsHtml;
+    }
+
+    // Set imported and anthropic custom fields to true
+    $customFields[$customFieldsPrefix . 'imported']  = true;
+    $customFields[$customFieldsPrefix . 'anthropic'] = true;
+
+    $mappedData['customFields'] = array_filter($customFields, fn($value) => $value !== null);
+
+    // Dimensions and weight (standardize via OpenAI API)
+    $weightValue          = isset($product['weight']) ? standardizeUnits($product['weight'], 'weight') : null;
+    $mappedData['weight'] = is_numeric($weightValue) ? (float)$weightValue : null;
+
+    $dimensions = isset($product['dimensions']) ? standardizeUnits($product['dimensions'], 'dimensions') : null;
+
+    if ($dimensions) {
+        $mappedData['length'] = $dimensions['length'] ?? null;
+        $mappedData['width']  = $dimensions['width'] ?? null;
+        $mappedData['height'] = $dimensions['height'] ?? null;
+    }
+
+    // Categories
+    $categoryId = $GLOBALS['categoryId'] ?? null;
+    if ($categoryId) {
+        $mappedData['categories'] = [['id' => $categoryId]];
+    }
+
+    // Prices
+    if (isset($product['buybox_winner']['price']['value'])) {
+        $grossPrice = $product['buybox_winner']['price']['value'];
+        $taxRate    = getTaxRate(); // e.g., 19.0
+        $netPrice   = $grossPrice / (1 + $taxRate / 100);
+
+        $mappedData['price'] = [
+            [
+                'currencyId' => getCurrencyId('EUR'),
+                'gross'      => $grossPrice,
+                'net'        => $netPrice,
+                'linked'     => false,
+            ]
+        ];
+    }
+
+    // Stock and availability
+    $availabilityType     = $product['buybox_winner']['availability']['type'] ?? 'out_of_stock';
+    $mappedData['stock']  = $availabilityType === 'in_stock' ? 100 : 0;
+    $mappedData['active'] = $availabilityType === 'in_stock';
+
+    // Sales channel assignment
+    $mappedData['visibilities'] = [
+        [
+            'salesChannelId' => getSalesChannelId(),
+            'visibility'     => 30, // Visibility all
+        ],
+    ];
+
+    // Images
+    $images = [];
+    if (isset($product['main_image']['link'])) {
+        $images[] = $product['main_image']['link'];
+    }
+    if (!empty($product['images']) && is_array($product['images'])) {
+        foreach ($product['images'] as $image) {
+            if (!empty($image['link'])) {
+                $images[] = $image['link'];
+            }
+        }
+    }
+    $mappedData['images'] = $images;
+
+    // Variants
+    if (!empty($product['variants']) && is_array($product['variants'])) {
+        $mappedData['configuratorSettings'] = mapVariants($product['variants']);
+    }
+
+    // Properties
+    if (!empty($product['attributes']) && is_array($product['attributes'])) {
+        $mappedData['properties'] = mapProperties($product['attributes']);
+    }
+
+    // Reviews
+    if (!empty($product['top_reviews']) && is_array($product['top_reviews'])) {
+        $mappedData['productReviews'] = mapReviews($product['top_reviews'], $mappedData['productNumber']);
+    }
+
+    // Remove null values from mapped data
+    $mappedData = array_filter($mappedData, fn($value) => $value !== null);
+
+    // Log the mapped product data
+    logMessage("Mapped product data for ASIN {$mappedData['productNumber']}: " . json_encode($mappedData));
+
+    // Return the mapped data
+    return $mappedData;
 }
 
 // Function to standardize units using OpenAI API
@@ -534,11 +522,11 @@ function formatReleaseDate(string $dateString): ?string
 // Function to get category ID based on customFields
 function getCategoryId(): string
 {
-    global $client, $shopwareApiUrl, $guzzleHeaders;
+    global $client, $shopwareApiUrl, $webhookData, $guzzleHeaders;
 
-    $collectionId = $GLOBALS['collectionId'] ?? null;
+    $collectionId = $webhookData['collection']['id'] ?? null;
     if (!$collectionId) {
-        throw new Exception('Collection ID is missing.');
+        throw new Exception('Collection ID is missing in webhook data.');
     }
 
     $token = getShopwareToken();
@@ -760,6 +748,7 @@ function getTaxRate(): float
     }
 }
 
+// Function to get default language ID
 // Function to get default language ID from the sales channel
 function getDefaultLanguageId(): string
 {
@@ -786,6 +775,11 @@ function getDefaultLanguageId(): string
                 'headers' => array_merge($guzzleHeaders, [
                     'Authorization' => "Bearer $token",
                 ]),
+                'query' => [
+                    'associations' => [
+                        'language' => [],
+                    ],
+                ],
             ]);
         });
 
@@ -802,6 +796,7 @@ function getDefaultLanguageId(): string
         throw $e;
     }
 }
+
 
 // Function to get Shopware authentication token
 function getShopwareToken(): ?string
@@ -1521,7 +1516,6 @@ function generateDescriptions(string $title, string $keywords): ?array
 
     $client = Anthropic::client($anthropicApiKey);
 
-
     $result = $client->messages()->create([
         'model' => 'claude-3-opus-20240229',
         'max_tokens' => 1024,
@@ -1531,6 +1525,7 @@ function generateDescriptions(string $title, string $keywords): ?array
     ]);
 
     $descriptions = parseGeneratedDescriptions($result->content[0]->text);
+
     return $descriptions;
 }
 
