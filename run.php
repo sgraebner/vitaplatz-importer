@@ -36,9 +36,8 @@ $requiredEnvVars = [
 
 foreach ($requiredEnvVars as $envVar) {
     if (empty($_ENV[$envVar])) {
-        http_response_code(500);
         echo "Environment variable $envVar is not set.";
-        exit;
+        exit(1);
     }
 }
 
@@ -118,64 +117,74 @@ function logMessage(string $message): void
     file_put_contents($generalLogFile, $logMessage, FILE_APPEND);
 }
 
-// Handle incoming webhook request
+// Main processing loop
 try {
-    // Ensure the request is a POST
-    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-        http_response_code(405);
-        exit('Method Not Allowed');
+    $processingDir = __DIR__ . '/processing';
+
+    // Check if processing directory exists
+    if (!is_dir($processingDir)) {
+        throw new Exception("Processing directory not found: $processingDir");
     }
 
-    // Get the POST body
-    $requestBody = file_get_contents('php://input');
-    $webhookData = json_decode($requestBody, true, flags: JSON_THROW_ON_ERROR);
+    // Get list of subdirectories (collection IDs)
+    $collectionDirs = array_filter(glob($processingDir . '/*'), 'is_dir');
 
-    // Log the received webhook data
-    logMessage('Received webhook data: ' . $requestBody);
-
-    // Extract download links
-    $downloadLinks = $webhookData['result_set']['download_links']['json']['pages'] ?? [];
-
-    if (empty($downloadLinks)) {
-        throw new Exception('No download links found in webhook payload');
+    if (empty($collectionDirs)) {
+        logMessage("No collections found in processing directory.");
+        exit;
     }
 
-    // Set webhook data globally for access in other functions
-    $GLOBALS['webhookData'] = $webhookData;
+    foreach ($collectionDirs as $collectionDir) {
+        // Get the collection ID from directory name
+        $collectionId = basename($collectionDir);
 
-    // Process each JSON page sequentially
-    foreach ($downloadLinks as $pageUrl) {
-        processJsonPage($pageUrl);
+        logMessage("Processing collection: $collectionId");
+
+        // Store collectionId globally for access in other functions
+        $GLOBALS['collectionId'] = $collectionId;
+
+        // Get list of JSON files in the collection directory
+        $jsonFiles = glob($collectionDir . '/*.json');
+
+        if (empty($jsonFiles)) {
+            logMessage("No JSON files found in collection directory: $collectionDir");
+            // Optionally delete the empty collection directory
+            // rmdir($collectionDir);
+            continue;
+        }
+
+        foreach ($jsonFiles as $jsonFile) {
+            processJsonFile($jsonFile);
+            // Delete the JSON file after processing
+            unlink($jsonFile);
+        }
+
+        // After processing all JSON files, check if directory is empty
+        if (count(glob($collectionDir . '/*')) === 0) {
+            // Delete the collection directory
+            rmdir($collectionDir);
+            logMessage("Deleted empty collection directory: $collectionDir");
+        }
     }
-
-    // Respond to the webhook
-    http_response_code(200);
-    echo 'Webhook processed successfully';
 
 } catch (Exception $e) {
     logError($e->getMessage() . "\n" . $e->getTraceAsString());
-    http_response_code(500);
-    echo 'An error occurred: ' . $e->getMessage();
-    exit;
+    exit('An error occurred: ' . $e->getMessage());
 }
 
-// Function to process a single JSON page
-function processJsonPage(string $pageUrl): void
+// Function to process a single JSON file
+function processJsonFile(string $filePath): void
 {
     global $client, $GLOBALS, $guzzleHeaders;
 
     try {
-        // Log the processing of the page
-        logMessage("Processing JSON page: $pageUrl");
+        // Log the processing of the file
+        logMessage("Processing JSON file: $filePath");
 
-        // Download the JSON page
-        $response = apiRequestWithRetry(function () use ($client, $pageUrl) {
-            return $client->get($pageUrl);
-        });
+        // Read the JSON file
+        $jsonData = json_decode(file_get_contents($filePath), true, flags: JSON_THROW_ON_ERROR);
 
-        $jsonData = json_decode($response->getBody(), true, flags: JSON_THROW_ON_ERROR);
-
-        // Retrieve and store the category ID (only once)
+        // Retrieve and store the category ID (only once per collection)
         if (!isset($GLOBALS['categoryId'])) {
             $categoryId            = getCategoryId();
             $GLOBALS['categoryId'] = $categoryId;
@@ -197,8 +206,6 @@ function processJsonPage(string $pageUrl): void
             processProduct($productResult);
         }
 
-    } catch (RequestException $e) {
-        logError('HTTP Request Error: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
     } catch (Exception $e) {
         logError('Processing Error: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
     }
@@ -310,7 +317,7 @@ function mapProductData(array $product): array
 
     $mappedData['releaseDate'] = isset($product['first_available']['raw']) ? formatReleaseDate($product['first_available']['raw']) : null;
 
-    $mappedData['keywords'] = $product['keywords']?? '';
+    $mappedData['keywords'] = $product['keywords'] ?? '';
     $mappedData['customSearchKeywords'] = $product['keywords_list'] ?? [];
 
     // Get or create manufacturer and set manufacturerId
@@ -323,15 +330,15 @@ function mapProductData(array $product): array
 
     // Custom fields
     $customFields = [];
-    $customFields[$customFieldsPrefix . 'parentAsin']     = $product['parent_asin'] ?? null;
-    $customFields[$customFieldsPrefix . 'productLink']    = $product['link'] ?? null;
-    $customFields[$customFieldsPrefix . 'shippingWeight'] = $product['shipping_weight'] ?? null;
+    $customFields[$customFieldsPrefix . 'parentAsin']      = $product['parent_asin'] ?? null;
+    $customFields[$customFieldsPrefix . 'productLink']     = $product['link'] ?? null;
+    $customFields[$customFieldsPrefix . 'shippingWeight']  = $product['shipping_weight'] ?? null;
     $customFields[$customFieldsPrefix . 'deliveryMessage'] = $product['delivery_message'] ?? null;
-    $customFields[$customFieldsPrefix . 'subTitle']       = $product['sub_title']['text'] ?? null;
-    $customFields[$customFieldsPrefix . 'ratingsTotal']   = $product['ratings_total'] ?? null;
-    $customFields[$customFieldsPrefix . 'reviewsTotal']   = $product['reviews_total'] ?? null;
-    $customFields[$customFieldsPrefix . 'isBundle']       = $product['is_bundle'] ?? null;
-    $customFields[$customFieldsPrefix . 'lastUpdate']     = (new \DateTime())->format('c');
+    $customFields[$customFieldsPrefix . 'subTitle']        = $product['sub_title']['text'] ?? null;
+    $customFields[$customFieldsPrefix . 'ratingsTotal']    = $product['ratings_total'] ?? null;
+    $customFields[$customFieldsPrefix . 'reviewsTotal']    = $product['reviews_total'] ?? null;
+    $customFields[$customFieldsPrefix . 'isBundle']        = $product['is_bundle'] ?? null;
+    $customFields[$customFieldsPrefix . 'lastUpdate']      = (new \DateTime())->format('c');
     // ... Add other custom fields as per mapping table
 
     if (!empty($product['feature_bullets']) && is_array($product['feature_bullets'])) {
@@ -522,11 +529,11 @@ function formatReleaseDate(string $dateString): ?string
 // Function to get category ID based on customFields
 function getCategoryId(): string
 {
-    global $client, $shopwareApiUrl, $webhookData, $guzzleHeaders;
+    global $client, $shopwareApiUrl, $guzzleHeaders;
 
-    $collectionId = $webhookData['collection']['id'] ?? null;
+    $collectionId = $GLOBALS['collectionId'] ?? null;
     if (!$collectionId) {
-        throw new Exception('Collection ID is missing in webhook data.');
+        throw new Exception('Collection ID is missing.');
     }
 
     $token = getShopwareToken();
@@ -673,7 +680,7 @@ function getCurrencyId(string $isoCode): string
         $data = json_decode($response->getBody(), true, flags: JSON_THROW_ON_ERROR);
 
         if (!empty($data['data'][0]['id'])) {
-            $currencyId           = $data['data'][0]['id'];
+            $currencyId            = $data['data'][0]['id'];
             $currencyIds[$isoCode] = $currencyId;
             return $currencyId;
         }
@@ -724,7 +731,7 @@ function getDefaultTaxId(): string
         $data = json_decode($response->getBody(), true, flags: JSON_THROW_ON_ERROR);
 
         if (!empty($data['data'][0]['id'])) {
-            $defaultTaxId               = $data['data'][0]['id'];
+            $defaultTaxId              = $data['data'][0]['id'];
             // Store the tax rate for price calculations
             $GLOBALS['defaultTaxRate'] = $data['data'][0]['taxRate'];
             return $defaultTaxId;
@@ -747,56 +754,6 @@ function getTaxRate(): float
         return $GLOBALS['defaultTaxRate'] ?? 19.0;
     }
 }
-
-// Function to get default language ID
-// Function to get default language ID from the sales channel
-function getDefaultLanguageId(): string
-{
-    global $client, $shopwareApiUrl, $guzzleHeaders;
-
-    static $defaultLanguageId = null;
-
-    if ($defaultLanguageId) {
-        return $defaultLanguageId;
-    }
-
-    $token = getShopwareToken();
-    if (!$token) {
-        throw new Exception('Unable to obtain Shopware token.');
-    }
-
-    // Get the sales channel ID
-    $salesChannelId = getSalesChannelId();
-
-    try {
-        enforceRateLimit();
-        $response = apiRequestWithRetry(function () use ($client, $shopwareApiUrl, $guzzleHeaders, $token, $salesChannelId) {
-            return $client->get("$shopwareApiUrl/api/sales-channel/$salesChannelId", [
-                'headers' => array_merge($guzzleHeaders, [
-                    'Authorization' => "Bearer $token",
-                ]),
-                'query' => [
-                    'associations' => [
-                        'language' => [],
-                    ],
-                ],
-            ]);
-        });
-
-        $data = json_decode($response->getBody(), true, flags: JSON_THROW_ON_ERROR);
-
-        if (!empty($data['data']['languageId'])) {
-            $defaultLanguageId = $data['data']['languageId'];
-            return $defaultLanguageId;
-        } else {
-            throw new Exception('Default language ID not found in sales channel.');
-        }
-    } catch (RequestException $e) {
-        logError('Error fetching default language ID from sales channel: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
-        throw $e;
-    }
-}
-
 
 // Function to get Shopware authentication token
 function getShopwareToken(): ?string
@@ -920,10 +877,10 @@ function createMediaFolder(): string
                     'Authorization' => "Bearer $token",
                 ]),
                 'json'    => [
-                    'id'                    => $mediaFolderId,
-                    'name'                  => $mediaFolderName,
+                    'id'                     => $mediaFolderId,
+                    'name'                   => $mediaFolderName,
                     'useParentConfiguration' => true,
-                    'configurationId'       => $configurationId,
+                    'configurationId'        => $configurationId,
                 ],
             ]);
         });
@@ -1145,7 +1102,7 @@ function uploadImages(array $imageUrls, string $token): array
     foreach ($imageUrls as $imageUrl) {
         try {
             // Extract filename from image URL
-            $filename                = basename(parse_url($imageUrl, PHP_URL_PATH));
+            $filename                 = basename(parse_url($imageUrl, PHP_URL_PATH));
             $fileNameWithoutExtension = pathinfo($filename, PATHINFO_FILENAME);
 
             // Check cache first
@@ -1468,7 +1425,7 @@ function getOptionId(string $groupId, string $optionName): string
 }
 
 // Function to map reviews
-function mapReviews(array $reviews, string $productId): array
+function mapReviews(array $reviews, string $productNumber): array
 {
     global $customFieldsPrefix;
 
@@ -1479,13 +1436,13 @@ function mapReviews(array $reviews, string $productId): array
     foreach ($reviews as $review) {
         $reviewData = [];
 
-        $reviewData['title']         = $review['title'] ?? 'No Title';
-        $reviewData['content']       = $review['body'] ?? '';
-        $reviewData['points']        = $review['rating'] ?? 0;
-        $reviewData['customerName']  = $review['profile']['name'] ?? 'Anonymous';
-        $reviewData['createdAt']     = isset($review['date']['utc']) ? date('Y-m-d H:i:s', strtotime($review['date']['utc'])) : date('Y-m-d H:i:s');
-        $reviewData['status']        = true;
-        $reviewData['productId']     = $productId;
+        $reviewData['title']          = $review['title'] ?? 'No Title';
+        $reviewData['content']        = $review['body'] ?? '';
+        $reviewData['points']         = $review['rating'] ?? 0;
+        $reviewData['customerName']   = $review['profile']['name'] ?? 'Anonymous';
+        $reviewData['createdAt']      = isset($review['date']['utc']) ? date('Y-m-d H:i:s', strtotime($review['date']['utc'])) : date('Y-m-d H:i:s');
+        $reviewData['status']         = true;
+        $reviewData['productNumber']  = $productNumber;
         $reviewData['salesChannelId'] = $salesChannelId;
 
         // Custom fields
@@ -1514,21 +1471,56 @@ function generateDescriptions(string $title, string $keywords): ?array
             . "Produktbeschreibung:\n"
             . "Meta-Beschreibung:";
 
-    $client = Anthropic::client($anthropicApiKey);
+    // Assuming you have an Anthropic client set up
+    // Replace this with actual API call to Anthropic
+    $response = callAnthropicApi($prompt);
 
-    $result = $client->messages()->create([
-        'model' => 'claude-3-opus-20240229',
-        'max_tokens' => 1024,
-        'messages' => [
-            ['role' => 'user', 'content' => $prompt],
-        ],
-    ]);
-
-    $descriptions = parseGeneratedDescriptions($result->content[0]->text);
+    $descriptions = parseGeneratedDescriptions($response);
 
     return $descriptions;
 }
 
+// Function to call Anthropic API
+function callAnthropicApi(string $prompt): string
+{
+    global $client, $anthropicApiKey, $guzzleHeaders;
+
+    try {
+        enforceRateLimit();
+        $response = apiRequestWithRetry(function () use ($client, $prompt, $anthropicApiKey, $guzzleHeaders) {
+            return $client->post('https://api.anthropic.com/v1/complete', [
+                'headers' => array_merge($guzzleHeaders, [
+                    'x-api-key' => $anthropicApiKey,
+                ]),
+                'json'    => [
+                    'prompt'           => $prompt,
+                    'model'            => 'claude-2',
+                    'max_tokens_to_sample' => 1024,
+                    'stop_sequences'   => ["\n\nHuman:"],
+                ],
+            ]);
+        });
+
+        $data = json_decode($response->getBody(), true, flags: JSON_THROW_ON_ERROR);
+
+        if (isset($data['completion'])) {
+            $apiResponse = $data['completion'];
+
+            // Log the raw response
+            logMessage("Anthropic API response: $apiResponse");
+
+            return $apiResponse;
+        } else {
+            throw new Exception('Invalid response from Anthropic API');
+        }
+
+    } catch (RequestException $e) {
+        logError('Anthropic API Error: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
+        return '';
+    }
+}
+
+// Function to parse generated descriptions
 function parseGeneratedDescriptions(string $completion): array
 {
     $lines               = explode("\n", $completion);
@@ -1536,9 +1528,9 @@ function parseGeneratedDescriptions(string $completion): array
     $productDescription  = '';
     $metaDescription     = '';
 
-    $isNewTitle            = false;
-    $isProductDescription  = false;
-    $isMetaDescription     = false;
+    $isNewTitle           = false;
+    $isProductDescription = false;
+    $isMetaDescription    = false;
 
     foreach ($lines as $line) {
         if (strpos($line, 'Neuer Produkttitel:') !== false) {
