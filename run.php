@@ -500,7 +500,7 @@ function callOpenAiApi(string $prompt): string
                     'Authorization' => "Bearer $openAiApiKey",
                 ]),
                 'json'    => [
-                    'model'       => 'gpt-4', // Use the specified model
+                    'model'       => 'gpt-4o-mini', // Use the specified model
                     'messages'    => [
                         [
                             'role'    => 'user',
