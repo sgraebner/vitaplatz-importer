@@ -118,66 +118,79 @@ function logMessage(string $message): void
     file_put_contents($generalLogFile, $logMessage, FILE_APPEND);
 }
 
-// Handle incoming webhook request
+// Main processing logic
 try {
-    // Ensure the request is a POST
-    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-        http_response_code(405);
-        exit('Method Not Allowed');
+    // Get the list of collection directories in the "processing" folder
+    $processingDir = __DIR__ . '/processing';
+
+    if (!is_dir($processingDir)) {
+        throw new Exception('Processing directory does not exist: ' . $processingDir);
     }
 
-    // Get the POST body
-    $requestBody = file_get_contents('php://input');
-    $webhookData = json_decode($requestBody, true, flags: JSON_THROW_ON_ERROR);
+    // Get list of collection directories
+    $collectionDirs = array_filter(glob($processingDir . '/*'), 'is_dir');
 
-    // Log the received webhook data
-    logMessage('Received webhook data: ' . $requestBody);
+    foreach ($collectionDirs as $collectionDir) {
+        // The collection ID is the folder name
+        $collectionId = basename($collectionDir);
 
-    // Extract download links
-    $downloadLinks = $webhookData['result_set']['download_links']['json']['pages'] ?? [];
+        // Set $webhookData accordingly
+        $webhookData = [
+            'collection' => [
+                'id' => $collectionId,
+            ],
+        ];
 
-    if (empty($downloadLinks)) {
-        throw new Exception('No download links found in webhook payload');
+        // Set webhook data globally for access in other functions
+        $GLOBALS['webhookData'] = $webhookData;
+
+        // Get the list of JSON files in the collection directory
+        $jsonFiles = glob($collectionDir . '/*.json');
+
+        if (empty($jsonFiles)) {
+            logMessage("No JSON files found in collection directory: $collectionDir");
+            // Optionally remove the empty directory
+            // rmdir($collectionDir);
+            continue;
+        }
+
+        // Process each JSON file
+        foreach ($jsonFiles as $jsonFile) {
+            processJsonFile($jsonFile);
+
+            // After processing, remove the file
+            unlink($jsonFile);
+        }
+
+        // After processing all files, if the directory is empty, remove it
+        if (count(glob($collectionDir . '/*')) === 0) {
+            rmdir($collectionDir);
+        }
     }
-
-    // Set webhook data globally for access in other functions
-    $GLOBALS['webhookData'] = $webhookData;
-
-    // Process each JSON page sequentially
-    foreach ($downloadLinks as $pageUrl) {
-        processJsonPage($pageUrl);
-    }
-
-    // Respond to the webhook
-    http_response_code(200);
-    echo 'Webhook processed successfully';
 
 } catch (Exception $e) {
     logError($e->getMessage() . "\n" . $e->getTraceAsString());
-    http_response_code(500);
-    echo 'An error occurred: ' . $e->getMessage();
-    exit;
+    exit('An error occurred: ' . $e->getMessage());
 }
 
-// Function to process a single JSON page
-function processJsonPage(string $pageUrl): void
+// Function to process a single JSON file
+function processJsonFile(string $filePath): void
 {
-    global $client, $GLOBALS, $guzzleHeaders;
-
     try {
-        // Log the processing of the page
-        logMessage("Processing JSON page: $pageUrl");
+        // Log the processing of the file
+        logMessage("Processing JSON file: $filePath");
 
-        // Download the JSON page
-        $response = apiRequestWithRetry(function () use ($client, $pageUrl) {
-            return $client->get($pageUrl);
-        });
+        // Read the JSON file
+        $jsonContent = file_get_contents($filePath);
+        if ($jsonContent === false) {
+            throw new Exception("Failed to read JSON file: $filePath");
+        }
 
-        $jsonData = json_decode($response->getBody(), true, flags: JSON_THROW_ON_ERROR);
+        $jsonData = json_decode($jsonContent, true, flags: JSON_THROW_ON_ERROR);
 
         // Retrieve and store the category ID (only once)
         if (!isset($GLOBALS['categoryId'])) {
-            $categoryId            = getCategoryId();
+            $categoryId = getCategoryId();
             $GLOBALS['categoryId'] = $categoryId;
             logMessage("Category ID retrieved: $categoryId");
         }
@@ -197,8 +210,6 @@ function processJsonPage(string $pageUrl): void
             processProduct($productResult);
         }
 
-    } catch (RequestException $e) {
-        logError('HTTP Request Error: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
     } catch (Exception $e) {
         logError('Processing Error: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
     }
@@ -233,6 +244,10 @@ function processProduct(array $product): void
         logError('Product Processing Error: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
     }
 }
+
+// ... [Rest of your functions remain unchanged] ...
+// (The rest of the functions stay the same as in your original script)
+
 
 // Function to check if a product exists in Shopware
 function productExistsInShopware(string $productNumber): bool
